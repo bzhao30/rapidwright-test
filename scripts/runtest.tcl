@@ -8,8 +8,8 @@
 #   Vivado:      finishes the clock and confirms the result
 #   Vivado:      runs the same design flat, as the baseline for comparison
 #
-# Results:  results/<run>_comparison.md and results/checkpoints/<run>_final.dcp
-# Details:  build/<run>/ holds reports and logs. Intermediate DCPs are kept there only if
+# Results:  results/runN/report.md and results/runN/final.dcp
+# Details:  build/runN/ holds reports and logs. Intermediate DCPs are kept there only if
 #           the pre-implemented flow fails, for debugging.
 # A failed check stops that flow, the other flow still runs, and the table records the
 # failure. The exit code is 0 only if the pre-implemented flow passes and the flat run routes.
@@ -539,9 +539,11 @@ proc table_row {label flat pre diff_kind} {
     return "| $label | $flat | $pre | $diff |\n"
 }
 
-proc write_comparison {path run_name flat_status pre_status} {
-    global PART PERIOD GENERICS
-    set text "# $run_name: flat Vivado vs pre-implemented\n\n"
+proc write_report {path flat_status pre_status} {
+    global PART PERIOD TOP GENERICS
+    set text "$TOP $GENERICS, $PART, $PERIOD ns clock, synthesis `-max_dsp $::max_dsp`.\n"
+    append text "Block: $::block_note. Selection: $::selection_source.\n"
+    append text "Pre-implemented time runs from full synthesis to the final clock route, and its FF count includes $::port_flops port flops.\n\n"
     append text "| Metric | Flat Vivado | Pre-implemented | Pre-implemented vs flat |\n|---|---|---|---|\n"
     append text "| Status | [one_line $flat_status] | [one_line $pre_status] | |\n"
     foreach {label key kind} {
@@ -560,25 +562,30 @@ proc write_comparison {path run_name flat_status pre_status} {
         set pre  [expr {[dict exists $::PRE $key] ? [dict get $::PRE $key] : "n/a"}]
         append text [table_row $label $flat $pre $kind]
     }
-    append text "\n## Run conditions\n\n"
-    append text "- Both flows: out of context, $PART, $PERIOD ns clock, generics `$GENERICS`, synthesis `-max_dsp $::max_dsp`, run one after the other.\n"
-    append text "- Block: $::block_note. Selection: $::selection_source.\n"
-    append text "- Pre-implemented compile time covers everything from full synthesis through the final Vivado clock route.\n"
-    append text "- Pre-implemented FF count includes $::port_flops flops that RapidWright adds on the top-level ports.\n"
     write_file $path $text
     puts "\n$text"
 }
 
+# Returns the next unused run number, so results/run1, run2 and so on never collide.
+proc next_run_name {results_dir} {
+    set highest 0
+    foreach dir [glob -nocomplain -directory $results_dir -tails run*] {
+        if {[regexp {^run(\d+)$} $dir -> n] && $n > $highest} { set highest $n }
+    }
+    return run[expr {$highest + 1}]
+}
+
 proc main {} {
-    global ROOT TOP GENERICS RAPIDWRIGHT_HOME
+    global ROOT RAPIDWRIGHT_HOME
 
     set RAPIDWRIGHT_HOME [file normalize $::env(RAPIDWRIGHT_PATH)]
     parse_args
-    set run_name $TOP[string map {= ""} [regsub -all {(^| )} $GENERICS _]]_[clock format [clock seconds] -format %Y%m%d_%H%M%S]
+    set run_name [next_run_name $ROOT/results]
     set run_dir $ROOT/build/$run_name
-    set final_dcp $ROOT/results/checkpoints/${run_name}_final.dcp
+    set result_dir $ROOT/results/$run_name
+    set final_dcp $result_dir/final.dcp
     file mkdir $run_dir
-    file mkdir [file dirname $final_dcp]
+    file mkdir $result_dir
 
     # Defaults for the table if the pre-implemented flow stops before setting them.
     set ::PRE {}
@@ -610,13 +617,13 @@ proc main {} {
     }
     close_open_designs
 
-    set table $ROOT/results/${run_name}_comparison.md
-    write_comparison $table $run_name $flat_status $pre_status
-    step "Done: $table"
+    set report $result_dir/report.md
+    write_report $report $flat_status $pre_status
+    step "Done: $report"
 
     # A flat run that misses timing is a valid measurement, so only a failure to route counts.
     if {$pre_status ne "PASS" || [string match FAILED* $flat_status]} {
-        puts "RUNTEST FAILED: see $table"
+        puts "RUNTEST FAILED: see $report"
         return 1
     }
     puts "RUNTEST PASSED: $final_dcp"
