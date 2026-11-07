@@ -1,4 +1,4 @@
-# Accelerated PnR for the Alveo V80
+# Accelerated PAR for the Alveo V80
 
 Routes one block once and copies it instead of placing and routing the whole design, then compares against flat Vivado. Claude picks the block and PBlock, Vivado implements one block, and RapidWright copies and stitches it.
 
