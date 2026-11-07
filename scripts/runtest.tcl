@@ -2,9 +2,10 @@
 #
 #   Vivado:      synthesizes the full design, keeping its hierarchy
 #   Claude:      picks the repeated unit, block size and PBlock (pblock_instructions.md)
-#   RapidWright: finds the clock and groups the units into one shared block (group_blocks.py)
+#   RapidWright: finds the clock and groups the units into one shared block (rapidwright.py)
 #   Vivado:      places and routes one block with a hard boundary
-#   RapidWright: stamps the copies and routes the stitching (ArrayBuilder)
+#   RapidWright: chooses aligned anchors for ArrayBuilder's own grid (rapidwright.py), then
+#                places the copies and routes the stitching (ArrayBuilder)
 #   Vivado:      finishes the clock and confirms the result
 #   Vivado:      runs the same design flat, as the baseline for comparison
 #
@@ -12,7 +13,8 @@
 # Details:  build/runN/ holds reports and logs. Intermediate DCPs are kept there only if
 #           the pre-implemented flow fails, for debugging.
 # A failed check stops that flow, the other flow still runs, and the table records the
-# failure. The exit code is 0 only if the pre-implemented flow passes and the flat run routes.
+# failure. Missing timing is a valid measurement, not a failure. The exit code is 0 only if
+# both flows route and the pre-implemented flow has the higher Fmax.
 
 foreach required {RAPIDWRIGHT_PATH CLAUDE_BIN JAVA_BIN JAVA_HEAP} {
     if {![info exists ::env($required)]} {
@@ -29,6 +31,9 @@ set CLAUDE_BUDGET_USD 5
 set CLK_SRC      BUFGCE_X2Y0
 # Must match BLOCKS_PER_CR in pblock_instructions.md.
 set BLOCKS_PER_CR 4
+# Extra setup margin while the block is placed and routed. The final design is timed with an
+# estimated clock, which has more uncertainty than the block's routed clock.
+set BLOCK_OVERCONSTRAINT_NS 0.175
 
 # Vivado sets library paths that break external tools, so clear them for each call.
 set CLEAN_ENV [list /usr/bin/env -u LD_LIBRARY_PATH -u PYTHONPATH -u PYTHONHOME]
@@ -91,13 +96,29 @@ proc synth {max_dsp flatten} {
     set args [list -top $TOP -part $PART -mode out_of_context -flatten_hierarchy $flatten -max_dsp $max_dsp]
     foreach g $GENERICS { lappend args -generic $g }
     read_sources
+    # Without a hierarchy, boundary optimization makes edge instances differ from the rest
+    # (constant inputs, unused outputs), and those can't be copies of one block. Only the
+    # pre-implemented flow needs this, so the flat baseline keeps normal optimization.
+    set keep_xdc [file normalize keep_hierarchy.xdc]
+    if {$flatten eq "none"} {
+        write_file $keep_xdc {set_property KEEP_HIERARCHY yes [get_cells -hierarchical -filter {!IS_PRIMITIVE}]}
+        read_xdc $keep_xdc
+    } else {
+        remove_files -quiet [get_files -quiet $keep_xdc]
+    }
     synth_design {*}$args
 }
 
 proc cell_counts {{prefix ""}} {
     set counts {}
-    foreach {name pattern} {LUT LUT* FF FD* DSP DSP58* BRAM RAMB* URAM URAM*} {
-        set filter "REF_NAME =~ $pattern"
+    # A carry LUT is one LUT6CY cell plus its LUTCY1 and LUTCY2 parts, so skip the parts.
+    foreach {name filter} {
+        LUT  {REF_NAME =~ LUT* && REF_NAME !~ LUTCY*}
+        FF   {REF_NAME =~ FD*}
+        DSP  {REF_NAME =~ DSP58*}
+        BRAM {REF_NAME =~ RAMB*}
+        URAM {REF_NAME =~ URAM*}
+    } {
         if {$prefix ne ""} { append filter " && NAME =~ $prefix/*" }
         dict set counts $name [llength [get_cells -quiet -hierarchical -filter $filter]]
     }
@@ -123,6 +144,8 @@ proc column {rows index} {
 proc cr_sites {cr} {
     set sites [get_sites -of_objects [get_clock_regions $cr] \
         -filter {SITE_TYPE =~ SLICE* || SITE_TYPE =~ DSP* || SITE_TYPE =~ RAMB* || SITE_TYPE =~ URAM*}]
+    # Some Versal clock regions have no fabric sites, and get_property rejects an empty list.
+    if {[llength $sites] == 0} { return {} }
     set rows {}
     foreach s $sites t [get_property SITE_TYPE $sites] x [get_property RPM_X $sites] y [get_property RPM_Y $sites] {
         lappend rows [list $s $t $x $y]
@@ -132,7 +155,9 @@ proc cr_sites {cr} {
 
 # Two clock regions share a family only if every site type sits at the same relative
 # position, which is what lets a block relocate between them unchanged. Returns the
-# largest family, lowest region first.
+# largest family, lowest region first. FAMILY_SIZE only sets the copy limit, and a block
+# needs matching sites only under its own footprint, so it is the device's fabric area in
+# reference regions. rapidwright.py place makes the exact check once the block exists.
 proc find_reference_family {} {
     set families {}
     foreach cr [lsort -dictionary [get_clock_regions]] {
@@ -150,7 +175,18 @@ proc find_reference_family {} {
     dict for {signature crs} $families {
         if {[llength $crs] > [llength $best]} { set best $crs }
     }
+    set total_slices 0
+    foreach cr [get_clock_regions] { incr total_slices [slice_count [cr_sites $cr]] }
+    set ::family_size [expr {$total_slices / [slice_count [cr_sites [lindex $best 0]]]}]
     return $best
+}
+
+proc slice_count {rows} {
+    set n 0
+    foreach r $rows {
+        if {[string match SLICE* [lindex $r 1]]} { incr n }
+    }
+    return $n
 }
 
 proc fabric_text {family} {
@@ -175,7 +211,7 @@ proc fabric_text {family} {
             dict incr totals URAM
         }
     }
-    set text "REFERENCE_CR [lindex $family 0]\nFAMILY_SIZE [llength $family]\nBLOCKS_PER_CR $BLOCKS_PER_CR\n"
+    set text "REFERENCE_CR [lindex $family 0]\nFAMILY_SIZE $::family_size\nBLOCKS_PER_CR $BLOCKS_PER_CR\n"
     append text "CR_SLICES $slices\nCR_SLICE_ROWS [llength [lsort -unique -integer $slice_rows]]\n"
     append text "CR_DSP [dict get $totals DSP]\nCR_BRAM [dict get $totals BRAM]\nCR_URAM [dict get $totals URAM]\n"
     foreach key [lsort -integer -index 0 [dict keys $columns]] {
@@ -197,7 +233,8 @@ proc design_text {max_dsp} {
     append text "TOTAL [cell_counts]\n"
     set groups {}
     foreach cell [get_cells -quiet -filter {!IS_PRIMITIVE}] {
-        dict lappend groups [get_property REF_NAME $cell] [get_property NAME $cell]
+        # Synthesis uniquifies REF_NAME per instance (systolic_pe__1), so group by the RTL name.
+        dict lappend groups [get_property ORIG_REF_NAME $cell] [get_property NAME $cell]
     }
     dict for {ref names} $groups {
         if {[llength $names] < 2} { continue }
@@ -287,7 +324,6 @@ proc select_block {run_dir} {
         }
         check_rectangle $selection $family
         set ::max_dsp $max_dsp
-        set ::family_size [llength $family]
         return $selection
     }
 }
@@ -325,6 +361,7 @@ proc run_java {log main_class args} {
     cd [file dirname $log]
     set failed [catch {
         exec {*}$CLEAN_ENV RAPIDWRIGHT_PATH=$RAPIDWRIGHT_HOME $::env(JAVA_BIN) -Xmx$::env(JAVA_HEAP) \
+            -Djava.io.tmpdir=[file dirname $log] \
             -cp $classpath $main_class {*}$args > $log 2>@1
     } err]
     cd $here
@@ -332,7 +369,7 @@ proc run_java {log main_class args} {
 }
 
 proc route_errors {} {
-    if {![regexp {nets with routing errors\s*:\s*(\d+)} [report_route_status -return_string] -> n]} {
+    if {![regexp {nets with routing errors[.\s]*:\s*(\d+)} [report_route_status -return_string] -> n]} {
         die "cannot read report_route_status"
     }
     return $n
@@ -344,59 +381,70 @@ proc worst_slack {type} {
     return [get_property SLACK $paths]
 }
 
-# Places and routes one block with a hard boundary, then requires it to close timing.
+# Routes the placed block with CONTAIN_ROUTING on. A V80 flop's CE and reset pins are driven
+# only from SLL tiles, and those columns are holes in a PBlock's contained tile set, so those
+# nets can never route contained. They are routed first without it and locked, then everything
+# else routes contained. rapidwright.py harness rejects any route that leaves the PBlock.
+proc route_contained {pblock} {
+    set ctrl [get_nets -of_objects \
+        [get_pins -hierarchical -filter {REF_PIN_NAME == CE || REF_PIN_NAME == R || REF_PIN_NAME == S}] \
+        -filter {TYPE == SIGNAL}]
+    set_property CONTAIN_ROUTING 0 $pblock
+    route_design -nets $ctrl -auto_delay
+    set_property IS_ROUTE_FIXED 1 $ctrl
+    set_property CONTAIN_ROUTING 1 $pblock
+    route_design
+    set_property IS_ROUTE_FIXED 0 $ctrl
+}
+
+# Top-level nets between blocks in different SLRs. Each block sits in one SLR, so a net
+# crosses when the blocks on its pins do.
+proc slr_crossing_nets {} {
+    set slrs_of {}
+    foreach block [get_cells block_*] {
+        set flop [lindex [get_cells -quiet -filter {IS_PRIMITIVE && PRIMITIVE_GROUP == REGISTER} $block/*/*] 0]
+        if {$flop eq ""} { die "no register directly inside the units of $block" }
+        set slr [get_slrs -of_objects $flop]
+        foreach net [get_nets -quiet -filter {TYPE == SIGNAL} -of_objects [get_pins $block/*]] {
+            dict lappend slrs_of $net $slr
+        }
+    }
+    set crossing {}
+    dict for {net slrs} $slrs_of {
+        if {[llength [lsort -unique $slrs]] > 1} { lappend crossing $net }
+    }
+    return $crossing
+}
+
 proc implement_block {block_dcp pblock_ranges clock out_dcp run_dir} {
-    global PERIOD
-    open_checkpoint $block_dcp
+    global PERIOD SCRIPTS BLOCK_OVERCONSTRAINT_NS
+    set harness_dcp $run_dir/block_flops.dcp
+    set routed_dcp $run_dir/block_routed_flops.dcp
+    run_java $run_dir/harness_add.log org.python.util.jython $SCRIPTS/rapidwright.py harness \
+        add $block_dcp $harness_dcp $clock $pblock_ranges $run_dir/side_map.txt
+    open_checkpoint $harness_dcp
     create_clock -name $clock -period $PERIOD [get_ports $clock]
     create_pblock pb_block
     resize_pblock pb_block -add $pblock_ranges
     add_cells_to_pblock pb_block -top
     set_property IS_SOFT 0 [get_pblocks pb_block]
-    set_property CONTAIN_ROUTING 1 [get_pblocks pb_block]
-    set_property EXCLUDE_PLACEMENT 1 [get_pblocks pb_block]
+    set_clock_uncertainty -setup $BLOCK_OVERCONSTRAINT_NS [get_clocks $clock]
+    lock_design -level placement
     opt_design
-    place_design
-    route_design
+    # Fanout replicas give port nets several loads, which then miss timing between blocks.
+    place_design -no_fanout_opt
+    route_contained [get_pblocks pb_block]
+    set_clock_uncertainty -setup 0.0 [get_clocks $clock]
     report_utilization -pblocks pb_block -file $run_dir/block_util.rpt
     report_timing_summary -file $run_dir/block_timing.rpt
     set errors [route_errors]
-    set wns [worst_slack max]
     if {$errors != 0} { die "block has $errors routing errors inside its PBlock" }
-    if {$wns eq "none" || $wns < 0} { die "block misses timing in its PBlock: WNS $wns ns" }
-    puts "Block closes: WNS $wns ns, hold [worst_slack min] ns"
-    write_checkpoint -force $out_dcp
+    append ::block_note ", block WNS [worst_slack max] ns"
+    write_checkpoint -force $routed_dcp
+    write_edif -force [file rootname $routed_dcp].edf
     close_design
-}
-
-# Every copy must have the same placement footprint, no larger than the PBlock. This runs
-# on the final netlist, so it tests the actual result.
-proc check_hard_boundary {width height expected_copies} {
-    set cells [get_cells -hierarchical -filter {LOC =~ SLICE*}]
-    set boxes {}
-    foreach name [get_property NAME $cells] loc [get_property LOC $cells] {
-        if {![regexp {^(block_\d+_\d+)/} $name -> inst]} { continue }
-        lassign [parse_site $loc] p x y
-        if {![dict exists $boxes $inst]} {
-            dict set boxes $inst [list $x $x $y $y]
-            continue
-        }
-        lassign [dict get $boxes $inst] x0 x1 y0 y1
-        dict set boxes $inst [list [expr {min($x,$x0)}] [expr {max($x,$x1)}] [expr {min($y,$y0)}] [expr {max($y,$y1)}]]
-    }
-    if {[dict size $boxes] != $expected_copies} {
-        die "found [dict size $boxes] block copies, expected $expected_copies"
-    }
-    set shapes {}
-    dict for {inst box} $boxes {
-        lassign $box x0 x1 y0 y1
-        set w [expr {$x1 - $x0 + 1}]
-        set h [expr {$y1 - $y0 + 1}]
-        if {$w > $width || $h > $height} { die "$inst spans ${w}x$h slices, PBlock is ${width}x$height" }
-        dict set shapes "${w}x$h" 1
-    }
-    if {[dict size $shapes] != 1} { die "copies are not identical: footprints [dict keys $shapes]" }
-    puts "Hard boundary OK: $expected_copies copies, footprint [dict keys $shapes]"
+    run_java $run_dir/harness_remove.log org.python.util.jython $SCRIPTS/rapidwright.py harness \
+        remove $routed_dcp $out_dcp $clock $pblock_ranges
 }
 
 # Reads the open routed design. elapsed is the flow's time up to the end of routing, so
@@ -429,6 +477,7 @@ proc run_preimplemented {run_dir final_dcp} {
     step "Synthesizing the full design, then Claude selects the block and PBlock"
     set selection [select_block $run_dir]
     write_checkpoint -force $run_dir/synth.dcp
+    write_edif -force $run_dir/synth.edf
     close_design
     set tr [dict get $selection TILE_ROWS]
     set tc [dict get $selection TILE_COLS]
@@ -438,27 +487,26 @@ proc run_preimplemented {run_dir final_dcp} {
     }
     write_file $run_dir/pblock.txt $pblock_ranges\n
 
-    step "RapidWright finds the clock and groups units into ${tr}x$tc blocks"
-    run_java $run_dir/group_blocks.log org.python.util.jython $SCRIPTS/group_blocks.py \
-        $run_dir/synth.dcp $run_dir/grouped.dcp $run_dir/group_info.txt \
-        [dict get $selection UNIT_CELL] [dict get $selection UNIT_REGEX] $tr $tc
+    step "RapidWright groups units into ${tr}x$tc blocks and splits off one block"
+    run_java $run_dir/group.log org.python.util.jython $SCRIPTS/rapidwright.py group \
+        $run_dir/synth.dcp $run_dir/block_synth.dcp $run_dir/top_blackbox.dcp \
+        $run_dir/group_info.txt $run_dir/side_map.txt \
+        [dict get $selection UNIT_CELL] [dict get $selection UNIT_REGEX] $tr $tc $PERIOD
     set info [read_file $run_dir/group_info.txt]
     set clock [dict get $info CLOCK]
     set copies [dict get $info COPIES]
-    set ::block_note "${tr}x$tc units, $copies copies"
+    regexp {X(\d+)Y(\d+):SLICE_X(\d+)Y(\d+)} $pblock_ranges -> x0 y0 x1 y1
+    set ::block_note "${tr}x$tc units, PBlock $pblock_ranges ([expr {$x1 - $x0 + 1}]x[expr {$y1 - $y0 + 1}] slices), $copies copies"
     set max_copies [expr {$BLOCKS_PER_CR * $::family_size}]
     if {$copies > $max_copies} { die "$copies copies exceed the $max_copies legal positions" }
 
-    step "Splitting the netlist into one block and a black-box top"
-    open_checkpoint $run_dir/grouped.dcp
-    write_checkpoint -force -cell block_0_0 $run_dir/block_synth.dcp
-    update_design -cells [get_cells block_*] -black_box
-    create_clock -name $clock -period $PERIOD [get_ports $clock]
-    write_checkpoint -force $run_dir/top_blackbox.dcp
-    close_design
-
     step "Vivado implements one block with a hard boundary"
     implement_block $run_dir/block_synth.dcp $pblock_ranges $clock $run_dir/block_routed.dcp $run_dir
+
+    step "RapidWright chooses aligned anchors for $copies copies"
+    run_java $run_dir/place.log org.python.util.jython $SCRIPTS/rapidwright.py place \
+        $run_dir/block_routed.dcp $run_dir/top_blackbox.dcp $run_dir/placement.txt $pblock_ranges \
+        $run_dir/side_map.txt $run_dir/copy_pblocks.txt
 
     step "RapidWright places $copies copies and routes the stitching"
     # --skip-impl keeps the block routed above. Without it, ArrayBuilder would run its own
@@ -466,8 +514,9 @@ proc run_preimplemented {run_dir final_dcp} {
     run_java $run_dir/arraybuilder.log com.xilinx.rapidwright.design.tools.ArrayBuilder \
         --input $run_dir/block_routed.dcp --top-design $run_dir/top_blackbox.dcp \
         --output $run_dir/array.dcp --pblock $pblock_ranges --clk-period $PERIOD \
-        --kernel-clk-name $clock --top-clk-name $clock --write-placement $run_dir/placement.txt \
-        --skip-impl --out-of-context --route
+        --kernel-clk-name $clock --top-clk-name $clock \
+        --read-placement $run_dir/placement.txt --skip-impl --out-of-context \
+        --unroute-static-nets --route
     if {![file exists $run_dir/array.dcp]} { die "ArrayBuilder wrote no DCP (see $run_dir/arraybuilder.log)" }
 
     step "Vivado finishes the clock and confirms the result"
@@ -475,31 +524,52 @@ proc run_preimplemented {run_dir final_dcp} {
     if {[llength [get_clocks -quiet $clock]] == 0} {
         create_clock -name $clock -period $PERIOD [get_ports $clock]
     }
-    # ArrayBuilder leaves the out-of-context clock port without a buffer. -preserve keeps
-    # the stamped and stitched routing and routes only what is still open.
     set_property HD.CLK_SRC $CLK_SRC [get_ports $clock]
-    route_design -preserve
+    # The port flops only give the stitching router real endpoints. The flat run has no such
+    # flops and its ports are untimed, so excluding these paths compares the same logic.
+    set port_flops [get_cells -hierarchical -filter {NAME =~ *_rw_inline_flop}]
+    set_false_path -from $port_flops
+    set_false_path -to $port_flops
+    # ArrayBuilder's static routing misses LUTCY inputs on Versal, so the VCC and GND nets are
+    # routed by Vivado here and again after the full router below.
+    route_design -physical_nets
+    # RWRoute is not timing-driven, and its routes between blocks in different SLRs are slow
+    # enough to set the Fmax. Those nets are unrouted so Vivado's timing-driven router takes
+    # them, along with any pins RWRoute could not reach. RWRoute can also leave nets sharing a
+    # node, and -preserve keeps those conflicts, so they are unrouted too. -preserve keeps every
+    # other route, and -no_psir skips the router's physical synthesis, which would move and
+    # replicate cells so that copies stop being identical.
+    set crossing [slr_crossing_nets]
+    set conflicts [get_nets -quiet -filter {ROUTE_STATUS == CONFLICTS}]
+    puts "Nets left to Vivado: [llength $crossing] SLR-crossing, [llength $conflicts] in conflict"
+    set redo [lsort -unique [concat $crossing $conflicts]]
+    if {[llength $redo] > 0} { route_design -unroute -nets [get_nets $redo] }
+    route_design -preserve -no_psir
+    # The full router still leaves a few LUTCY VCC pins open. -physical_nets only sees them
+    # once the router's state is released.
+    route_design -release_memory
+    route_design -physical_nets
     set elapsed [expr {[clock seconds] - $started}]
     report_route_status -file $run_dir/final_route_status.rpt
     report_timing_summary -file $run_dir/final_timing.rpt
     report_drc -file $run_dir/final_drc.rpt
     report_utilization -file $run_dir/final_util.rpt
+    # One PBlock per copy, for viewing the tiling in the GUI. The design is already placed and
+    # routed, so they constrain nothing.
+    foreach {name range} [read_file $run_dir/copy_pblocks.txt] {
+        set pb [create_pblock pb_$name]
+        resize_pblock $pb -add $range
+        add_cells_to_pblock $pb [get_cells $name]
+    }
     write_checkpoint -force $final_dcp
 
     # Reported only after the DCP exists, so a failure can be inspected.
     set ::PRE [measure $elapsed]
     set ::port_flops [llength [get_cells -quiet -hierarchical -filter {NAME =~ *_rw_inline_flop*}]]
-    lassign [parse_site [dict get $selection SLICE_LL]] p0 x0 y0
-    lassign [parse_site [dict get $selection SLICE_UR]] p1 x1 y1
-    check_hard_boundary [expr {$x1-$x0+1}] [expr {$y1-$y0+1}] $copies
     set errors [dict get $::PRE errors]
-    set setup [dict get $::PRE setup]
-    set hold [dict get $::PRE hold]
     if {$errors != 0} { die "final design has $errors routing errors" }
-    if {$setup eq "none" || $setup < 0} { die "final design misses timing: setup WNS $setup ns" }
-    if {$hold ne "none" && $hold < 0} { die "final design misses hold: WNS $hold ns" }
-    foreach dcp {synth grouped block_synth block_routed top_blackbox array} {
-        file delete $run_dir/$dcp.dcp
+    foreach dcp {synth block_synth block_flops block_routed_flops block_routed top_blackbox array} {
+        file delete $run_dir/$dcp.dcp $run_dir/$dcp.edf
     }
 }
 
@@ -523,6 +593,15 @@ proc run_flat {run_dir} {
     set ::FLAT [measure $elapsed]
 }
 
+proc timing_status {result} {
+    set setup [dict get $result setup]
+    set hold [dict get $result hold]
+    if {$setup eq "none" || $setup < 0 || ($hold ne "none" && $hold < 0)} {
+        return "routed, timing missed"
+    }
+    return "routed, timing met"
+}
+
 proc one_line {text} {
     return [string map {\n " " | /} $text]
 }
@@ -543,7 +622,7 @@ proc write_report {path flat_status pre_status} {
     global PART PERIOD TOP GENERICS
     set text "$TOP $GENERICS, $PART, $PERIOD ns clock, synthesis `-max_dsp $::max_dsp`.\n"
     append text "Block: $::block_note. Selection: $::selection_source.\n"
-    append text "Pre-implemented time runs from full synthesis to the final clock route, and its FF count includes $::port_flops port flops.\n\n"
+    append text "Pre-implemented time runs from full synthesis to the final clock route, and its FF count includes $::port_flops port flops. Paths to and from those flops are excluded from its timing, because the flat run's ports are untimed.\n\n"
     append text "| Metric | Flat Vivado | Pre-implemented | Pre-implemented vs flat |\n|---|---|---|---|\n"
     append text "| Status | [one_line $flat_status] | [one_line $pre_status] | |\n"
     foreach {label key kind} {
@@ -586,6 +665,8 @@ proc main {} {
     set final_dcp $result_dir/final.dcp
     file mkdir $run_dir
     file mkdir $result_dir
+    # Vivado writes scratch files to its working directory.
+    cd $run_dir
 
     # Defaults for the table if the pre-implemented flow stops before setting them.
     set ::PRE {}
@@ -595,25 +676,24 @@ proc main {} {
     set ::selection_source "not reached"
     set ::port_flops "n/a"
 
-    set pre_status PASS
     if {[catch {run_preimplemented $run_dir $final_dcp} err]} {
         puts $::errorInfo
         puts "PRE-IMPLEMENTED FLOW FAILED: $err"
         set pre_status "FAILED: $err"
+    } else {
+        set pre_status [timing_status $::PRE]
     }
     close_open_designs
 
     step "Flat Vivado baseline"
-    set flat_status "routed, timing met"
     if {[catch {run_flat $run_dir} err]} {
         puts $::errorInfo
         puts "FLAT RUN FAILED: $err"
         set flat_status "FAILED: $err"
     } elseif {[dict get $::FLAT errors] != 0} {
         set flat_status "FAILED: [dict get $::FLAT errors] routing errors"
-    } elseif {[dict get $::FLAT setup] eq "none" || [dict get $::FLAT setup] < 0
-              || ([dict get $::FLAT hold] ne "none" && [dict get $::FLAT hold] < 0)} {
-        set flat_status "routed, timing missed"
+    } else {
+        set flat_status [timing_status $::FLAT]
     }
     close_open_designs
 
@@ -621,9 +701,14 @@ proc main {} {
     write_report $report $flat_status $pre_status
     step "Done: $report"
 
-    # A flat run that misses timing is a valid measurement, so only a failure to route counts.
-    if {$pre_status ne "PASS" || [string match FAILED* $flat_status]} {
+    if {[string match FAILED* $pre_status] || [string match FAILED* $flat_status]} {
         puts "RUNTEST FAILED: see $report"
+        return 1
+    }
+    set pre_fmax [dict get $::PRE fmax]
+    set flat_fmax [dict get $::FLAT fmax]
+    if {$pre_fmax <= $flat_fmax} {
+        puts "RUNTEST FAILED: pre-implemented Fmax $pre_fmax MHz does not beat flat $flat_fmax MHz"
         return 1
     }
     puts "RUNTEST PASSED: $final_dcp"

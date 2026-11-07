@@ -27,19 +27,38 @@ module systolic_pe #(
     reg signed [ACC_W-1:0]    acc;
     reg                       drain_d;
 
+    // Reset is registered once in every PE, so the array-wide net only reaches D pins and all
+    // routing to the flops' R pins stays inside the PE. direct_reset keeps it on the R pin.
+    // Otherwise synthesis can merge it into a LUT in front of the register, which adds logic
+    // to paths that must also cross an SLR. KEEP stops synthesis merging these across PEs.
+    (* keep = "true", direct_reset = "yes" *) reg rst_local;
+    always @(posedge clk) rst_local <= rst;
+
+    // Internal copies of the outgoing registers, loaded on the same cycle. Each PE's output
+    // registers then drive only the next PE, so the routes between PEs never carry the
+    // multiplier or valid logic. KEEP stops synthesis from merging the copies back together.
+    (* keep = "true" *) reg signed [DATA_W-1:0] a_mul;
+    (* keep = "true" *) reg signed [DATA_W-1:0] b_mul;
+    (* keep = "true" *) reg                     a_valid_mul;
+    (* keep = "true" *) reg                     b_valid_mul;
+
     // Datapath registers have no reset so they map cleanly to DSP or fabric registers.
     always @(posedge clk) begin
         a_out <= a_in;
         b_out <= b_in;
-        prod  <= a_out * b_out;
+        a_mul <= a_in;
+        b_mul <= b_in;
+        prod  <= a_mul * b_mul;
         if (drain_d) res_out <= acc;
         else         res_out <= res_in;
     end
 
     always @(posedge clk) begin
-        if (rst) begin
+        if (rst_local) begin
             a_valid_out   <= 1'b0;
             b_valid_out   <= 1'b0;
+            a_valid_mul   <= 1'b0;
+            b_valid_mul   <= 1'b0;
             prod_valid    <= 1'b0;
             drain_d       <= 1'b0;
             drain_out     <= 1'b0;
@@ -48,7 +67,9 @@ module systolic_pe #(
         end else begin
             a_valid_out   <= a_valid_in;
             b_valid_out   <= b_valid_in;
-            prod_valid    <= a_valid_out & b_valid_out;
+            a_valid_mul   <= a_valid_in;
+            b_valid_mul   <= b_valid_in;
+            prod_valid    <= a_valid_mul & b_valid_mul;
             drain_d       <= drain_in;
             drain_out     <= drain_d;
             res_valid_out <= drain_d | res_valid_in;
@@ -59,9 +80,9 @@ module systolic_pe #(
 
 endmodule
 
-module systolic128 #(
-    parameter ROWS   = 128,
-    parameter COLS   = 128,
+module systolic64 #(
+    parameter ROWS   = 64,
+    parameter COLS   = 64,
     parameter DATA_W = 8,
     parameter ACC_W  = 32
 ) (

@@ -1,7 +1,7 @@
 `timescale 1ns / 1ps
 
 interface systolic_if #(
-    parameter ROWS = 128, parameter COLS = 128, parameter DATA_W = 8, parameter ACC_W = 32
+    parameter ROWS = 64, parameter COLS = 64, parameter DATA_W = 8, parameter ACC_W = 32
 ) (input logic clk);
     logic                   rst;
     logic [ROWS*DATA_W-1:0] a_in;
@@ -13,9 +13,9 @@ interface systolic_if #(
     logic [COLS-1:0]        res_valid_out;
 endinterface
 
-module systolic128_tb;
-    parameter int ROWS      = 128;
-    parameter int COLS      = 128;
+module systolic64_tb;
+    parameter int ROWS      = 64;
+    parameter int COLS      = 64;
     parameter int DATA_W    = 8;
     parameter int ACC_W     = 32;
     parameter int NUM_TESTS = 200;
@@ -398,7 +398,7 @@ module systolic128_tb;
 
     systolic_if #(ROWS, COLS, DATA_W, ACC_W) sif (clk);
 
-    systolic128 #(.ROWS(ROWS), .COLS(COLS), .DATA_W(DATA_W), .ACC_W(ACC_W)) dut (
+    systolic64 #(.ROWS(ROWS), .COLS(COLS), .DATA_W(DATA_W), .ACC_W(ACC_W)) dut (
         .clk(clk),
         .rst(sif.rst),
         .a_in(sif.a_in),

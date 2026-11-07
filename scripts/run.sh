@@ -1,8 +1,8 @@
 #!/bin/bash
 # Runs the pre-implemented flow and the flat Vivado baseline, then writes results/runN/.
 # Usage: scripts/run.sh --top <module> --period <ns> [--generic NAME=VALUE]... <source files>
-#   Example: scripts/run.sh --top systolic128 --period 2.0 \
-#                --generic ROWS=64 --generic COLS=64 hdl/src/systolic128.v
+#   Example: scripts/run.sh --top systolic64 --period 2.0 \
+#                --generic ROWS=64 --generic COLS=64 hdl/src/systolic64.v
 #
 # ---- Edit these for your machine, or set them in the environment. ------------------
 VIVADO_SETTINGS="${VIVADO_SETTINGS:-/opt/xilinx/Vivado/2024.2/settings64.sh}"
