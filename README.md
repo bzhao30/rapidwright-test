@@ -1,6 +1,6 @@
 # Accelerated PnR for the Alveo V80
 
-Routes one block once and copies it instead of placing and routing the whole design, then compares the result against flat Vivado. Claude picks the block and PBlock, Vivado implements one block, and RapidWright copies and stitches it.
+Routes one block once and copies it instead of placing and routing the whole design, then compares against flat Vivado. Claude picks the block and PBlock, Vivado implements one block, and RapidWright copies and stitches it.
 
 A run passes if both flows route and the pre-implemented flow has the higher Fmax. Closing timing at the requested period is not required.
 
@@ -17,12 +17,12 @@ Each run gets `results/runN/` with `report.md` and `final.dcp`. Logs go to `buil
 ## How it works
 
 1. Vivado synthesizes the full design, and Claude picks the block size and PBlock.
-2. RapidWright groups the PEs into identical blocks, writes one block, and writes the top with every block as a black box.
-3. Vivado places and routes one block inside its PBlock with `CONTAIN_ROUTING` on.
-4. ArrayBuilder places the copies and routes the stitching between them with RWRoute.
+2. RapidWright groups the PEs into identical blocks and writes one block plus a top with every block black-boxed.
+3. Vivado places and routes one block in a hard PBlock (`IS_SOFT 0`, `CONTAIN_ROUTING` except CE/reset nets).
+4. ArrayBuilder stamps the routed block at each anchor (whole PBlock heights apart), and RWRoute routes the stitching.
 5. Vivado finishes the design:
    - It unroutes the nets between blocks in different SLRs, which RWRoute routes slowly, along with any nets RWRoute left in conflict.
-   - It routes those nets with `route_design -preserve -no_psir`. This keeps every other route and leaves the cells where they are.
+   - It routes those nets with `route_design -preserve -no_psir`, keeping every other route and cell in place.
    - It routes the VCC/GND pins that ArrayBuilder misses on Versal.
 
 ## Results
