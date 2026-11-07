@@ -25,6 +25,18 @@ Each run gets `results/runN/` with `report.md` and `final.dcp`. Logs go to `buil
    - It routes those nets with `route_design -preserve -no_psir`, keeping every other route and cell in place.
    - It routes the VCC/GND pins that ArrayBuilder misses on Versal.
 
+## Files
+
+| File | What it does |
+|---|---|
+| `scripts/run.sh` | Entry point. Holds the machine paths, checks the tools, and starts `runtest.tcl` in Vivado. |
+| `scripts/runtest.tcl` | The whole flow: synthesis, the Claude call, the block run, stitching, final routing, the flat baseline and `report.md`. |
+| `scripts/pblock_instructions.md` | The rules Claude follows to choose the repeated unit, the block size and the PBlock rectangle. |
+| `scripts/rapidwright.py` | The Jython RapidWright steps: `group` (builds the block and black-box top), `harness` (adds and removes port flops around the block run) and `place` (picks aligned anchors for ArrayBuilder). |
+| `hdl/src/systolic64.v` | The test design: a parameterized systolic array of `systolic_pe` units. |
+| `hdl/sim/systolic64_tb.sv` | Randomized testbench that checks the array's results. |
+| `hdl/sim/run_xsim.sh` | Compiles and runs the testbench in XSim. |
+
 ## Results
 
 `systolic64` at a 2.0 ns target with 8x4-PE blocks. Neither flow closes timing at 2.0 ns.
