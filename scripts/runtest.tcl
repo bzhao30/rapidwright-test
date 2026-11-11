@@ -9,7 +9,7 @@
 #   Vivado:      finishes the clock and confirms the result
 #   Vivado:      runs the same design flat, as the baseline for comparison
 #
-# Results:  results/runN/report.md and results/runN/final.dcp
+# Results:  results/runN/report.md, results/runN/final.dcp and results/runN/flat.dcp
 # Details:  build/runN/ holds reports and logs. Intermediate DCPs are kept there only if
 #           the pre-implemented flow fails, for debugging.
 # A failed check stops that flow, the other flow still runs, and the table records the
@@ -573,9 +573,9 @@ proc run_preimplemented {run_dir final_dcp} {
     }
 }
 
-# A general Vivado run with default directives and no PBlocks. Its DCP is not kept. The
-# clock comes from synthesis, because no block selection may have been made.
-proc run_flat {run_dir} {
+# A general Vivado run with default directives and no PBlocks. The clock comes from
+# synthesis, because no block selection may have been made.
+proc run_flat {run_dir flat_dcp} {
     global PERIOD CLK_SRC
     set started [clock seconds]
     synth $::max_dsp rebuilt
@@ -587,6 +587,8 @@ proc run_flat {run_dir} {
     place_design
     route_design
     set elapsed [expr {[clock seconds] - $started}]
+    # Written after the time is taken, so the DCP doesn't count toward the flat compile time.
+    write_checkpoint -force $flat_dcp
     report_route_status -file $run_dir/flat_route_status.rpt
     report_timing_summary -file $run_dir/flat_timing.rpt
     report_utilization -file $run_dir/flat_util.rpt
@@ -686,7 +688,7 @@ proc main {} {
     close_open_designs
 
     step "Flat Vivado baseline"
-    if {[catch {run_flat $run_dir} err]} {
+    if {[catch {run_flat $run_dir $result_dir/flat.dcp} err]} {
         puts $::errorInfo
         puts "FLAT RUN FAILED: $err"
         set flat_status "FAILED: $err"

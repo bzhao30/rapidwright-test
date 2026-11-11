@@ -12,7 +12,7 @@ Set your paths at the top of `scripts/run.sh`, then:
 scripts/run.sh --top systolic64 --period 2.0 --generic ROWS=64 --generic COLS=64 hdl/src/systolic64.v
 ```
 
-Each run gets `results/runN/` with `report.md` and `final.dcp`. Logs go to `build/runN/`.
+Each run gets `results/runN/` with `report.md`, `final.dcp` (pre-implemented) and `flat.dcp` (flat baseline). Logs go to `build/runN/`.
 
 ## How it works
 
