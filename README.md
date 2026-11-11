@@ -44,11 +44,10 @@ Each run gets `results/runN/` with `report.md` and `final.dcp`. Logs go to `buil
 | Metric | Flat Vivado | Pre-implemented | Pre-implemented vs flat |
 |---|---|---|---|
 | Fmax | 369.5 MHz | 467.1 MHz | +26.4% |
-| Setup WNS | -0.706 ns | -0.141 ns | +0.565 ns |
 | Compile time | 57.4 min | 52.0 min | -9.4% |
 | LUT / FF / DSP | 143296 / 302337 / 4096 | 143360 / 306433 / 4096 | |
 
-The block alone has WNS +0.598 ns. Both flows route with 0 errors.
+The block alone reaches 713.3 MHz. Both flows route with 0 errors.
 
 Vivado writes an EDIF next to each checkpoint that RapidWright reads. Without it, RapidWright starts another Vivado to decrypt the netlist, which takes minutes at 64x64.
 
