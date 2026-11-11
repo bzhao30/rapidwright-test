@@ -115,7 +115,7 @@ proc cell_counts {{prefix ""}} {
     foreach {name filter} {
         LUT  {REF_NAME =~ LUT* && REF_NAME !~ LUTCY*}
         FF   {REF_NAME =~ FD*}
-        DSP  {REF_NAME =~ DSP58*}
+        DSP  {REF_NAME =~ DSP58* && PRIMITIVE_LEVEL != INTERNAL}
         BRAM {REF_NAME =~ RAMB*}
         URAM {REF_NAME =~ URAM*}
     } {

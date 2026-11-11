@@ -334,32 +334,19 @@ def place(args):
     device = design.getDevice()
     module = Module(design, True)
     module.calculateAllValidPlacements(device)
-    anchor = re.match(r"SLICE_X(\d+)Y(\d+)", module.getAnchor().getName())
-    home_x, home_y = int(anchor.group(1)), int(anchor.group(2))
-
-    legal = set()
-    for site in module.getAllValidPlacements():
-        found = re.match(r"SLICE_X(\d+)Y(\d+)$", site.getName())
-        if found and (int(found.group(2)) - home_y) % height == 0:
-            legal.add((int(found.group(1)), int(found.group(2))))
-    print("Implemented at X%dY%d, PBlock height %d, %d aligned anchors" % (home_x, home_y, height, len(legal)))
-
-    top = read_checkpoint(top_dcp)
-    EDIFTools.removeVivadoBusPreventionAnnotations(top.getNetlist())
-    names = ArrayBuilder.getMatchingModuleInstanceNames(module, top)
-    side_map = InlineFlopTools.parseSideMap(design.getNetlist(), side_map_path)
-    grid = ArrayNetlistGraph(top, names, side_map).getGreedyPlacementGrid()
-    grid = dict(((e.getKey().getFirst(), e.getKey().getSecond()), e.getValue()) for e in grid.entrySet())
-    cols = max(p[0] for p in grid) + 1
-    rows = max(p[1] for p in grid) + 1
-    print("ArrayNetlistGraph grid: %d columns, %d rows, %d copies" % (cols, rows, len(grid)))
-
-    array = Design("array", design.getPartName())
-    probe = array.createModuleInst("probe", module)
 
 
-    def site_at(x, y):
-        return device.getSite("SLICE_X%dY%d" % (x, y))
+    def slice_xy(site_insts):
+        # Lowest slice column and row the block uses. Module's anchor can be a DSP or another
+        # site type, so the rules below work in these slice coordinates instead, and each
+        # position maps back to the anchor site that ArrayBuilder's placement file needs.
+        xs, ys = [], []
+        for si in site_insts:
+            found = re.match(r"SLICE_X(\d+)Y(\d+)$", si.getSiteName())
+            if found and "STATIC_SOURCE" not in si.getName():
+                xs.append(int(found.group(1)))
+                ys.append(int(found.group(2)))
+        return min(xs), min(ys)
 
 
     def one_clock_region(inst):
@@ -371,12 +358,33 @@ def place(args):
         return True
 
 
-    def fits(x, y):
-        if (x, y) not in legal or not probe.place(site_at(x, y), True, False):
-            return False
-        good = one_clock_region(probe)
+    home_x, home_y = slice_xy(design.getSiteInsts())
+    array = Design("array", design.getPartName())
+    probe = array.createModuleInst("probe", module)
+    # Maps the lowest slice (x, y) of each legal copy to its anchor site.
+    legal = {}
+    for site in module.getAllValidPlacements():
+        if not probe.place(site, True, False):
+            continue
+        x, y = slice_xy(probe.getSiteInsts())
+        if (y - home_y) % height == 0 and one_clock_region(probe):
+            legal[(x, y)] = site
         probe.unplace()
-        return good
+    print("Implemented at slice X%dY%d (anchor %s), PBlock height %d, %d aligned anchors"
+          % (home_x, home_y, module.getAnchor().getName(), height, len(legal)))
+
+    top = read_checkpoint(top_dcp)
+    EDIFTools.removeVivadoBusPreventionAnnotations(top.getNetlist())
+    names = ArrayBuilder.getMatchingModuleInstanceNames(module, top)
+    side_map = InlineFlopTools.parseSideMap(design.getNetlist(), side_map_path)
+    grid = ArrayNetlistGraph(top, names, side_map).getGreedyPlacementGrid()
+    grid = dict(((e.getKey().getFirst(), e.getKey().getSecond()), e.getValue()) for e in grid.entrySet())
+    cols = max(p[0] for p in grid) + 1
+    rows = max(p[1] for p in grid) + 1
+    print("ArrayNetlistGraph grid: %d columns, %d rows, %d copies" % (cols, rows, len(grid)))
+
+    def fits(x, y):
+        return (x, y) in legal
 
 
     # Columns come from the row with the most anchors. Some are legal on only some rows, so the
@@ -418,7 +426,7 @@ def place(args):
     for (col, row), name in sorted(grid.items()):
         # The grid counts rows downward, and device rows count upward.
         x, y = xs[col], good_ys[rows - 1 - row]
-        out.write("%s SLICE_X%dY%d\n" % (name, x, y))
+        out.write("%s %s\n" % (name, legal[(x, y)].getName()))
         dx, dy = x - home_x, y - home_y
         pblocks.write("%s SLICE_X%dY%d:SLICE_X%dY%d\n" % (name, x0 + dx, y0 + dy, x1 + dx, y1 + dy))
     out.close()

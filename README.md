@@ -33,20 +33,22 @@ Each run gets `results/runN/` with `report.md` and `final.dcp`. Logs go to `buil
 | `scripts/runtest.tcl` | The whole flow: synthesis, the Claude call, the block run, stitching, final routing, the flat baseline and `report.md`. |
 | `scripts/pblock_instructions.md` | The rules Claude follows to choose the repeated unit, the block size and the PBlock rectangle. |
 | `scripts/rapidwright.py` | The Jython RapidWright steps: `group` (builds the block and black-box top), `harness` (adds and removes port flops around the block run) and `place` (picks aligned anchors for ArrayBuilder). |
-| `hdl/src/systolic64.v` | The test design: a parameterized systolic array of `systolic_pe` units. |
+| `hdl/src/systolic64.v` | The test design: a parameterized systolic array of `systolic_pe` units, each mapping its multiply-accumulate to one DSP58. |
 | `hdl/sim/systolic64_tb.sv` | Randomized testbench that checks the array's results. |
 | `hdl/sim/run_xsim.sh` | Compiles and runs the testbench in XSim. |
 
 ## Results
 
-`systolic64` at a 2.0 ns target with 8x4-PE blocks. Neither flow closes timing at 2.0 ns.
+`systolic64` 64x64 (run26) at a 2.0 ns target, one DSP58 per PE, 8x4-PE blocks (128 copies) in PBlock `SLICE_X84Y92:SLICE_X103Y139 DSP_X0Y46:DSP_X1Y69`. Neither flow closes timing at 2.0 ns.
 
-| Array | Flat Fmax | Pre-implemented Fmax | Flat time | Pre-implemented time |
-|---|---|---|---|---|
-| 8x8 (run20) | 456.8 MHz | 490.9 MHz (+7.5%) | 8.0 min | 14.3 min |
-| 64x64 (run21) | 408.5 MHz | 456.8 MHz (+11.8%) | 103.6 min | 71.1 min (-31%) |
+| Metric | Flat Vivado | Pre-implemented | Pre-implemented vs flat |
+|---|---|---|---|
+| Fmax | 369.5 MHz | 467.1 MHz | +26.4% |
+| Setup WNS | -0.706 ns | -0.141 ns | +0.565 ns |
+| Compile time | 57.4 min | 52.0 min | -9.4% |
+| LUT / FF / DSP | 143296 / 302337 / 4096 | 143360 / 306433 / 4096 | |
 
-The machine was shared and loaded during run21. An earlier 64x64 run took 79.5 min flat. run21 predates a fix to the grouping step that saves about 7 more minutes. At 8x8 the fixed steps dominate, so the pre-implemented flow is slower there.
+The block alone has WNS +0.598 ns. Both flows route with 0 errors.
 
 Vivado writes an EDIF next to each checkpoint that RapidWright reads. Without it, RapidWright starts another Vivado to decrypt the netlist, which takes minutes at 64x64.
 

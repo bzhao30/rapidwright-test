@@ -1,5 +1,8 @@
 `timescale 1ns / 1ps
 
+// use_dsp maps the multiply-accumulate into one DSP58 per PE: a_dsp/b_dsp become AREG/BREG,
+// prod becomes MREG and acc becomes PREG. Without it, Vivado builds the 8x8 multiply in LUTs.
+(* use_dsp = "yes" *)
 module systolic_pe #(
     parameter DATA_W = 8,
     parameter ACC_W  = 32
@@ -22,6 +25,9 @@ module systolic_pe #(
     output reg                      res_valid_out
 );
 
+    reg signed [DATA_W-1:0]   a_dsp;
+    reg signed [DATA_W-1:0]   b_dsp;
+    reg                       dsp_valid;
     reg signed [2*DATA_W-1:0] prod;
     reg                       prod_valid;
     reg signed [ACC_W-1:0]    acc;
@@ -37,6 +43,9 @@ module systolic_pe #(
     // Internal copies of the outgoing registers, loaded on the same cycle. Each PE's output
     // registers then drive only the next PE, so the routes between PEs never carry the
     // multiplier or valid logic. KEEP stops synthesis from merging the copies back together.
+    // It also keeps a_mul and b_mul in the fabric next to a_out and b_out, so a route that
+    // crosses a block boundary never ends at a DSP input, which is slow to reach. a_dsp and
+    // b_dsp then load the DSP's A and B registers from inside the PE.
     (* keep = "true" *) reg signed [DATA_W-1:0] a_mul;
     (* keep = "true" *) reg signed [DATA_W-1:0] b_mul;
     (* keep = "true" *) reg                     a_valid_mul;
@@ -48,7 +57,9 @@ module systolic_pe #(
         b_out <= b_in;
         a_mul <= a_in;
         b_mul <= b_in;
-        prod  <= a_mul * b_mul;
+        a_dsp <= a_mul;
+        b_dsp <= b_mul;
+        prod  <= a_dsp * b_dsp;
         if (drain_d) res_out <= acc;
         else         res_out <= res_in;
     end
@@ -59,6 +70,7 @@ module systolic_pe #(
             b_valid_out   <= 1'b0;
             a_valid_mul   <= 1'b0;
             b_valid_mul   <= 1'b0;
+            dsp_valid     <= 1'b0;
             prod_valid    <= 1'b0;
             drain_d       <= 1'b0;
             drain_out     <= 1'b0;
@@ -69,7 +81,8 @@ module systolic_pe #(
             b_valid_out   <= b_valid_in;
             a_valid_mul   <= a_valid_in;
             b_valid_mul   <= b_valid_in;
-            prod_valid    <= a_valid_mul & b_valid_mul;
+            dsp_valid     <= a_valid_mul & b_valid_mul;
+            prod_valid    <= dsp_valid;
             drain_d       <= drain_in;
             drain_out     <= drain_d;
             res_valid_out <= drain_d | res_valid_in;
