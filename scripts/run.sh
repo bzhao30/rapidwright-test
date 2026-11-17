@@ -1,15 +1,17 @@
 #!/bin/bash
-# Runs the pre-implemented flow and the flat Vivado baseline, then writes results/runN/.
-# Usage: scripts/run.sh --top <module> --period <ns> [--generic NAME=VALUE]... <source files>
-#   Example: scripts/run.sh --top systolic64 --period 2.0 \
+# Runs the pre-implemented flow (Claude picks the block) and the flat Vivado baseline, into results/runN/.
+# Usage: scripts/run.sh --top <module> --period <ns> [--generic NAME=VALUE]... [--block SPEC]
+#                       [--flat fresh|none|results/runM] <source files>
+#   Example: scripts/run.sh --top systolic64 --period 1.8 \
 #                --generic ROWS=64 --generic COLS=64 hdl/src/systolic64.v
+# See scripts/run.py for the steps and options.
 #
 # ---- Edit these for your machine, or set them in the environment. ------------------
 VIVADO_SETTINGS="${VIVADO_SETTINGS:-/opt/xilinx/Vivado/2024.2/settings64.sh}"
 RAPIDWRIGHT_PATH="${RAPIDWRIGHT_PATH:-/work/shared/users/meng/bjz24/RapidWright}"
 CLAUDE_BIN="${CLAUDE_BIN:-claude}"
 JAVA_BIN="${JAVA_BIN:-java}"
-JAVA_HEAP="${JAVA_HEAP:-128g}"
+JAVA_HEAP="${JAVA_HEAP:-64g}"
 # License server, if your shell doesn't already set one (for example 2100@host).
 XILINXD_LICENSE_FILE="${XILINXD_LICENSE_FILE:-}"
 # -------------------------------------------------------------------------------------
@@ -31,6 +33,5 @@ set -u
 export RAPIDWRIGHT_PATH CLAUDE_BIN JAVA_BIN JAVA_HEAP
 if [ -n "$XILINXD_LICENSE_FILE" ]; then export XILINXD_LICENSE_FILE; fi
 
-mkdir -p "$ROOT/build"
-exec vivado -mode batch -nojournal -log "$ROOT/build/vivado_$(date +%Y%m%d_%H%M%S).log" \
-    -source "$ROOT/scripts/runtest.tcl" -tclargs "$@"
+mkdir -p "$ROOT/build" "$ROOT/results"
+exec python3 "$ROOT/scripts/run.py" "$@"
