@@ -1,11 +1,11 @@
 # The RapidWright steps of the flow (run.py). Each step runs as its own Jython call:
 #
-#   rapidwright.py group <in.dcp> <block.dcp> <top_blackbox.dcp> <info.txt> <side map> <unit cell> <regex>
+#   rapidwright.py group <top.edf> <unit.edf> <block.dcp> <top_blackbox.dcp> <info.txt> <side map> <unit cell> <regex>
 #                        <block rows> <block cols> <clock period>
 #   rapidwright.py harness add <in.dcp> <out.dcp> <clock> <pblock ranges> <side map>
-#   rapidwright.py harness remove <in.dcp> <out.dcp> <clock> <pblock ranges>
-#   rapidwright.py place <block_routed.dcp> <top_blackbox.dcp> <placement.txt> <pblock ranges> <side map>
-#                        <copy_pblocks.txt> <result.json>
+#                  (harness remove <in.dcp> <out.dcp> <clock> <pblock ranges> runs inside array)
+#   rapidwright.py array <block_routed_flops.dcp> <block_routed.dcp> <clock> <pblock ranges> <top_blackbox.dcp>
+#                        <side map> <placement.txt> <copy_pblocks.txt> <grid.json> <out.dcp> <clock period>
 #   rapidwright.py check <candidates.json> <out.json>
 #   rapidwright.py fabric <part> [clock region]
 
@@ -22,8 +22,7 @@ from com.xilinx.rapidwright.device import Node
 
 
 # A checkpoint Vivado writes has an encrypted netlist, and RapidWright decrypts it by running
-# Vivado again, which takes several minutes on a large design. runtest.tcl writes the netlist
-# next to those checkpoints, so this reads it from there when it exists.
+# Vivado again. flow.tcl writes the netlist next to its checkpoints, so this reads it from there.
 def read_checkpoint(dcp):
     edf = dcp[:-len(".dcp")] + ".edf"
     if os.path.exists(edf):
@@ -36,17 +35,39 @@ def die(msg):
     sys.exit(1)
 
 
+# Fills the empty unit instances of the top netlist (synthesized with the unit as a black box)
+# with the unit's own netlist, so every unit references one synthesized cell.
+def fill_units(top_edf, unit_edf, unit_cell):
+    netlist = EDIFTools.readEdifFile(top_edf)
+    unit = EDIFTools.readEdifFile(unit_edf).getTopCell()
+    top = netlist.getTopCell()
+    insts = [i for i in top.getCellInsts() if re.sub(r"__\d+$", "", i.getCellType().getName()) == unit_cell]
+    if not insts:
+        die("no black-box instances of %s in the top" % unit_cell)
+    for name in set(i.getCellType().getName() for i in insts):
+        netlist.getWorkLibrary().removeCell(name)
+    netlist.migrateCellAndSubCells(unit)
+    for inst in insts:
+        inst.setCellType(unit)
+        inst.removeProperty("black_box")
+    netlist.resetParentNetMap()
+    return netlist
+
+
 # Groups repeated sibling instances into identical blocks that all reference one shared
 # cell. RegroupInstances can't do this: it makes a separate cell per group, with port names
 # and port sets that vary by position, and ArrayBuilder needs identical interfaces. The regex
 # must capture a unit's row and column from its instance name. Writes one block and the top
-# with every block as a black box, which takes Vivado over 10 minutes on a large design.
+# with every block as a black box.
 def group(args):
-    in_dcp, block_dcp, top_dcp, info_path, side_map_path, unit_cell, regex = args[0:7]
-    block_rows, block_cols, period = int(args[7]), int(args[8]), args[9]
+    top_edf, unit_edf, block_dcp, top_dcp, info_path, side_map_path, unit_cell, regex = args[0:8]
+    block_rows, block_cols, period = int(args[8]), int(args[9]), args[10]
 
-    design = read_checkpoint(in_dcp)
-    netlist = design.getNetlist()
+    netlist = fill_units(top_edf, unit_edf, unit_cell)
+    design = Design(netlist)
+    # Synthesized out of context: the top's ports connect to other logic, not to I/O pads.
+    design.setDesignOutOfContext(True)
+    design.setAutoIOBuffers(False)
     top = netlist.getTopCell()
 
     clock_net = ClockTools.getClockFromDesign(design)
@@ -192,13 +213,10 @@ def group(args):
         for tile_index, tile in enumerate(tiles):
             if signature[tile_index] is None:
                 continue
-            for port_inst in top.getNet(signature[tile_index]).getPortInsts():
-                cell_inst = port_inst.getCellInst()
-                if cell_inst is None or not is_unit(cell_inst):
+            for other in owners_of_net(signature[tile_index]):
+                if other is None:
                     continue
-                match = re.match(regex + "$", cell_inst.getName())
-                dr = int(match.group(1)) // block_rows - tile[0]
-                dc = int(match.group(2)) // block_cols - tile[1]
+                dr, dc = other[0] - tile[0], other[1] - tile[1]
                 if dr == 0 and dc > 0:
                     sides.add("RIGHT")
                 elif dr == 0 and dc < 0:
@@ -649,8 +667,7 @@ def fabric(args):
 
 
 # Writes an ArrayBuilder placement file for the implemented block.
-#   rapidwright.py place <block_routed.dcp> <top_blackbox.dcp> <placement.txt> <pblock ranges>
-#                        <side map> <copy_pblocks.txt> <result.json>
+#   place(block_routed.dcp, top_blackbox.dcp, placement.txt, pblock ranges, side map, copy_pblocks.txt, grid.json)
 # ArrayNetlistGraph, the graph ArrayBuilder itself uses, decides which copy sits next to which.
 # The anchors are the module's own valid placements, kept only where the tile pattern of the
 # whole footprint matches (see Geometry), so every copy sees the same clock rows as the original.
@@ -753,7 +770,18 @@ def place(args):
     print("Grid X%s Y%s" % (xs, ys))
 
 
-STEPS = {"group": group, "harness": harness, "place": place, "check": check, "fabric": fabric}
+# Everything after the block run, in one JVM so the device loads once: removes the port flops,
+# writes the copy placement, then has ArrayBuilder stamp the copies and RWRoute route them.
+def array(args):
+    flops_dcp, block_dcp, clock, ranges, top_dcp, side_map, placement, pblocks, grid, out_dcp, period = args
+    harness(["remove", flops_dcp, block_dcp, clock, ranges])
+    place([block_dcp, top_dcp, placement, ranges, side_map, pblocks, grid])
+    ArrayBuilder.main(["--input", block_dcp, "--top-design", top_dcp, "--output", out_dcp, "--pblock", ranges,
+                       "--clk-period", period, "--kernel-clk-name", clock, "--top-clk-name", clock,
+                       "--read-placement", placement, "--skip-impl", "--out-of-context", "--unroute-static-nets", "--route"])
+
+
+STEPS = {"group": group, "harness": harness, "array": array, "check": check, "fabric": fabric}
 if len(sys.argv) < 2 or sys.argv[1] not in STEPS:
-    die("usage: rapidwright.py group|harness|place|check|fabric <arguments>")
+    die("usage: rapidwright.py group|harness|array|check|fabric <arguments>")
 STEPS[sys.argv[1]](sys.argv[2:])

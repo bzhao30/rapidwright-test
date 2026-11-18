@@ -1,40 +1,59 @@
 #!/usr/bin/env python3
-"""One run of the pre-implemented flow against flat Vivado, into results/runN/. Start it with run.sh.
+"""Pre-implemented compile of a repeated-unit design on the V80, against flat Vivado, into results/runN/.
 
-  Vivado       synthesizes the design with its hierarchy kept, and run.py finds the unit grid
-  Claude       picks the block size and PBlock rectangle once, from agent_instructions.md
-  RapidWright  checks the rectangle, then groups the units into one block (rapidwright.py)
-  Vivado       places and routes one block inside its PBlock (flow.tcl impl)
-  RapidWright  places the copies and routes the wires between them (rapidwright.py place, ArrayBuilder)
-  Vivado       reroutes the SLR-crossing nets and times the whole array (flow.tcl stitch)
-  Vivado       runs the same design flat, as the baseline (flow.tcl flat)
+  scripts/run.py --top systolic64 --period 1.8 --generic ROWS=64 --generic COLS=64 hdl/src/systolic64.v
 
-  run.py --top T --period NS [--generic K=V ...] [--block SPEC] [--flat fresh|none|results/runM] SOURCES
+Compile, timed from RTL to the routed checkpoint:
+  1. Vivado synthesizes the repeated unit alone, and the top with the unit as a black box, in parallel.
+  2. Claude ranks up to 3 block sizes and PBlock rectangles from agent_instructions.md, and the first
+     that passes RapidWright's check against the device is used, moved by a few slices if that is
+     what it takes. If none passes, Claude is asked again with the problems, up to 3 times.
+  3. RapidWright fills the black boxes with the unit and groups the units into blocks.
+  4. Vivado places and routes one block inside its PBlock.
+  5. RapidWright stamps the block across the device and RWRoute routes everything between copies
+     (ArrayBuilder). Its checkpoint is the result: the full design never goes back into Vivado.
+Measured afterwards, outside the compile time:
+  6. Vivado opens the result only to time it and check its routing.
+  7. Vivado runs the same RTL flat, as the baseline.
 
---block "8x2 SLICE_X84Y96:SLICE_X103Y111" skips Claude and uses that block, to reproduce a result.
---flat results/runM reuses that run's flat result, which is fair only for the same design, clock
-and Vivado version. The exit code is 0 only if both flows route and the pre-implemented Fmax is higher.
+Options: --block "8x2 SLICE_X84Y96:SLICE_X103Y111" skips Claude. --unit NAME names the repeated
+module if the top instantiates several. --flat fresh|none|results/runM runs, skips or reuses the
+flat baseline (reuse only for the same RTL, clock and Vivado). The exit code is 0 if the result
+is fully routed within the 45-minute limit.
 """
 
 import argparse
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
+
+# ---- Edit these for your machine, or set them in the environment. ----------------------------
+VIVADO_SETTINGS = os.environ.get("VIVADO_SETTINGS", "/opt/xilinx/Vivado/2024.2/settings64.sh")
+RAPIDWRIGHT_PATH = os.environ.get("RAPIDWRIGHT_PATH", "/work/shared/users/meng/bjz24/RapidWright")
+CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
+JAVA_BIN = os.environ.get("JAVA_BIN", "java")
+JAVA_HEAP = os.environ.get("JAVA_HEAP", "64g")
+# ------------------------------------------------------------------------------------------------
 
 SCRIPTS = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(SCRIPTS)
 PART = "xcv80-lsva4737-2MHP-e-S"
 CLK_SRC = "BUFGCE_X2Y0"
 CLAUDE_MODEL = "claude-opus-5-5"
-CLAUDE_BUDGET_USD = 5
-# RWRoute can stall on a congested stitch, so ArrayBuilder fails after this long.
-ARRAYBUILDER_LIMIT_S = 90 * 60
+CLAUDE_EFFORT = "medium"
+CLAUDE_TRIES = 3
+TARGET_MIN, LIMIT_MIN = 10, 45
+# RWRoute can stall on a congested array, so ArrayBuilder fails after this long.
+ARRAYBUILDER_LIMIT_S = 30 * 60
 # Rows a PBlock keeps from the top and bottom of its SLR (rapidwright.py EDGE_ROWS).
 EDGE_ROWS = 12
+# The most empty slices between neighboring copies. ArrayBuilder runs RWRoute with a fixed bounding
+# box, which gives up on SLR crossings that also span a wider gap (32 rows in run45).
+MAX_GAP = 16
 
 
 class ToolError(Exception):
@@ -42,7 +61,7 @@ class ToolError(Exception):
 
 
 def step(msg):
-    print("\n=== [%s] %s" % (time.strftime("%H:%M:%S"), msg), flush=True)
+    print("=== [%s] %s" % (time.strftime("%H:%M:%S"), msg), flush=True)
 
 
 def save(path, data):
@@ -71,12 +90,28 @@ def numbers(raw):
 # ---- Running the tools ------------------------------------------------------------------------
 
 def clean_env(extra=None):
-    """Vivado's library paths break Java and Claude, so they are cleared for each call."""
+    """The environment for Java and Claude: Vivado's library paths break both."""
     env = dict(os.environ)
     for key in ("LD_LIBRARY_PATH", "PYTHONPATH", "PYTHONHOME"):
         env.pop(key, None)
     env.update(extra or {})
     return env
+
+
+_vivado_env = None
+
+
+def vivado_env():
+    global _vivado_env
+    if _vivado_env is None:
+        if not os.path.exists(VIVADO_SETTINGS):
+            raise ToolError("VIVADO_SETTINGS not found: %s" % VIVADO_SETTINGS)
+        out = subprocess.check_output(["bash", "-c", 'source "$1" > /dev/null 2>&1; env -0', "_", VIVADO_SETTINGS])
+        _vivado_env = dict(kv.split("=", 1) for kv in out.decode(errors="replace").split("\0") if "=" in kv)
+        # Vivado writes large temporary files, which shared machines' /tmp often has no room for.
+        _vivado_env["TMPDIR"] = os.path.join(ROOT, "build", "tmp")
+        os.makedirs(_vivado_env["TMPDIR"], exist_ok=True)
+    return _vivado_env
 
 
 def tail(path, pattern=r"ERROR|FAILED|Exception|Traceback|Error", lines=6):
@@ -88,7 +123,7 @@ def tail(path, pattern=r"ERROR|FAILED|Exception|Traceback|Error", lines=6):
     return " | ".join((hits or text)[-lines:])[-1500:]
 
 
-def run(cmd, log, cwd, env=None, timeout=None):
+def run(cmd, log, cwd, env, timeout=None):
     with open(log, "w") as out:
         try:
             return subprocess.call(cmd, stdout=out, stderr=subprocess.STDOUT, cwd=cwd, env=env, timeout=timeout)
@@ -97,16 +132,15 @@ def run(cmd, log, cwd, env=None, timeout=None):
             raise ToolError("%s ran past its %d-minute limit (log %s)" % (os.path.basename(cmd[0]), timeout // 60, log))
 
 
-def java_cmd(main, args, cwd):
-    rw = os.environ["RAPIDWRIGHT_PATH"]
-    return [os.environ.get("JAVA_BIN", "java"), "-Xmx" + os.environ.get("JAVA_HEAP", "64g"), "-Djava.io.tmpdir=" + cwd,
-            "-cp", "%s/build/libs/rapidwright.jar:%s/jars/*" % (rw, rw), main] + [str(a) for a in args]
+def java(main, args, log, cwd, timeout=None):
+    cmd = [JAVA_BIN, "-Xmx" + JAVA_HEAP, "-Djava.io.tmpdir=" + cwd, "-cp",
+           "%s/build/libs/rapidwright.jar:%s/jars/*" % (RAPIDWRIGHT_PATH, RAPIDWRIGHT_PATH), main] + [str(a) for a in args]
+    if run(cmd, log, cwd, clean_env(), timeout) != 0:
+        raise ToolError("%s failed: %s (log %s)" % (main.split(".")[-1], tail(log, r"RAPIDWRIGHT FAILED|Error|Exception"), log))
 
 
-def jython(step_name, args, log, cwd):
-    cmd = java_cmd("org.python.util.jython", [os.path.join(SCRIPTS, "rapidwright.py"), step_name] + list(args), cwd)
-    if run(cmd, log, cwd, clean_env()) != 0:
-        raise ToolError("rapidwright.py %s failed: %s (log %s)" % (step_name, tail(log, r"RAPIDWRIGHT FAILED|Error|Exception"), log))
+def jython(step_name, args, log, cwd, timeout=None):
+    java("org.python.util.jython", [os.path.join(SCRIPTS, "rapidwright.py"), step_name] + list(args), log, cwd, timeout)
 
 
 def tcl_value(value):
@@ -119,7 +153,7 @@ def vivado(cfg, command, params, work_dir):
     """Runs one flow.tcl command in its own Vivado process and returns its result lines."""
     os.makedirs(work_dir, exist_ok=True)
     params = dict(params, part=PART, top=cfg["top"], period=cfg["period"], generics=cfg["generics"],
-                  sources=cfg["sources"], clk_src=CLK_SRC, work_dir=work_dir)
+                  clk_src=CLK_SRC, work_dir=work_dir)
     params_path = os.path.join(work_dir, command + "_params.tcl")
     result_path = os.path.join(work_dir, command + "_result.txt")
     log = os.path.join(work_dir, command + "_vivado.log")
@@ -128,8 +162,14 @@ def vivado(cfg, command, params, work_dir):
             f.write("%s %s\n" % (key, tcl_value(value)))
     if os.path.exists(result_path):
         os.remove(result_path)
-    code = run(["vivado", "-mode", "batch", "-nojournal", "-log", log, "-source", os.path.join(SCRIPTS, "flow.tcl"),
-                "-tclargs", command, params_path, result_path], log + ".out", work_dir)
+    with open(log + ".out", "w") as out:
+        proc = subprocess.Popen(["vivado", "-mode", "batch", "-nojournal", "-log", log, "-source", os.path.join(SCRIPTS, "flow.tcl"),
+                                 "-tclargs", command, params_path, result_path], stdout=out, stderr=subprocess.STDOUT,
+                                cwd=work_dir, env=vivado_env())
+        # Vivado takes about 10 s to exit after it writes its result, so the flow goes on without it.
+        while proc.poll() is None and not os.path.exists(result_path):
+            time.sleep(0.5)
+    code = proc.returncode or 0
     result = {}
     if os.path.exists(result_path):
         with open(result_path) as f:
@@ -148,7 +188,67 @@ def vivado(cfg, command, params, work_dir):
     return result
 
 
-# ---- Synthesis and the unit grid --------------------------------------------------------------
+# ---- 1. Synthesis -----------------------------------------------------------------------------
+
+def find_unit(sources, top, unit=None):
+    """The repeated module: the one the top instantiates. Returns it and the black-box sources."""
+    text = dict((s, open(s).read()) for s in sources)
+    modules = {}
+    for path, src in text.items():
+        for m in re.finditer(r"\bmodule\s+(\w+)", src):
+            modules[m.group(1)] = (path, m.start())
+    if top not in modules:
+        raise ToolError("no module %s in the sources (only Verilog sources are supported)" % top)
+    path, start = modules[top]
+    body = text[path][start:text[path].index("endmodule", start)]
+    used = sorted(set(m.group(1) for m in re.finditer(r"^\s*(\w+)\s*(?:#\s*\(|\w+\s*\()", body, re.M)
+                      if m.group(1) in modules and m.group(1) != top))
+    if unit is None:
+        if len(used) != 1:
+            raise ToolError("the top instantiates %s; name the repeated one with --unit" % (", ".join(used) or "no module"))
+        unit = used[0]
+    # The black box keeps the unit's ANSI header, which ends at the first ");", and drops its body.
+    path, start = modules[unit]
+    src = text[path]
+    header_end = src.index(");", start) + 2
+    stub = src[:start] + "(* black_box *) " + src[start:header_end] + "\n" + src[src.index("endmodule", start):]
+    return unit, path, stub
+
+
+def synthesize(cfg, run_dir, unit_name=None):
+    work = os.path.join(run_dir, "synth")
+    os.makedirs(work, exist_ok=True)
+    unit, unit_file, stub = find_unit(cfg["sources"], cfg["top"], unit_name)
+    stub_path = os.path.join(work, "blackbox_" + os.path.basename(unit_file))
+    with open(stub_path, "w") as f:
+        f.write(stub)
+    top_sources = [stub_path if s == unit_file else s for s in cfg["sources"]]
+    with ThreadPoolExecutor(3) as pool:
+        unit_job = pool.submit(vivado, cfg, "synth_unit", {"unit": unit, "sources": cfg["sources"]}, os.path.join(work, "unit"))
+        top_job = pool.submit(vivado, cfg, "synth_top", {"sources": top_sources}, os.path.join(work, "top"))
+        fabric_job = pool.submit(fabric_text, run_dir)
+        unit_result, _, fabric = unit_job.result(), top_job.result(), fabric_job.result()
+    with open(os.path.join(work, "top", "units.txt")) as f:
+        regex, rows, cols = infer_grid([line.strip() for line in f if line.strip()])
+    if regex is None:
+        raise ToolError("instances of %s do not form a row/column grid" % unit)
+    # Wires from the first unit to its neighbors, by direction.
+    wires = {}
+    with open(os.path.join(work, "top", "neighbors.txt")) as f:
+        lines = [line.split() for line in f if line.strip()]
+    with open(os.path.join(work, "top", "units.txt")) as f:
+        r0, c0 = [int(v) for v in re.fullmatch(regex, f.readline().strip()).groups()]
+    for name, count in lines:
+        r, c = [int(v) for v in re.fullmatch(regex, name).groups()]
+        direction = {(0, 1): "next column", (1, 0): "next row"}.get((r - r0, c - c0), "other")
+        wires[direction] = wires.get(direction, 0) + int(count)
+    counts = unit_result["counts"].split()
+    design = {"unit_cell": unit, "unit_regex": regex, "unit_rows": rows, "unit_cols": cols, "wires": wires,
+              "unit": dict(zip(counts[::2], [int(v) for v in counts[1::2]])),
+              "unit_edf": os.path.join(work, "unit", "unit.edf"), "top_edf": os.path.join(work, "top", "top.edf")}
+    save(os.path.join(run_dir, "design.json"), design)
+    return design, fabric
+
 
 def infer_grid(names):
     """Finds the two numbers in the instance names that form a full row/column grid."""
@@ -179,83 +279,53 @@ def infer_grid(names):
     return None, 0, 0
 
 
-def synthesize(cfg, run_dir):
-    start = time.time()
-    work = os.path.join(run_dir, "synth")
-    result = vivado(cfg, "prepare", {}, work)
-    groups = []
-    with open(os.path.join(work, "groups.txt")) as f:
-        for line in f:
-            fields = line.split()
-            if len(fields) >= 2:
-                groups.append((fields[0], int(fields[1]), dict(zip(fields[2::2], [int(v) for v in fields[3::2]]))))
-    if not groups:
-        raise ToolError("synthesis found no repeated cells")
-    # The unit is the repeated cell holding the most logic.
-    groups.sort(key=lambda g: (-g[1] * (g[2]["LUT"] + g[2]["FF"]), -g[1], g[0]))
-    cell, count, counts = groups[0]
-    with open(os.path.join(work, "units_%s.txt" % cell)) as f:
-        regex, rows, cols = infer_grid([line.strip() for line in f if line.strip()])
-    if regex is None:
-        raise ToolError("instances of %s do not form a row/column grid" % cell)
-    total = result["total"].split()
-    design = {"unit_cell": cell, "unit_regex": regex, "unit_rows": rows, "unit_cols": cols, "unit": counts,
-              "total": dict(zip(total[::2], [int(v) for v in total[1::2]])), "synth_seconds": round(time.time() - start, 1),
-              "synth_dcp": os.path.join(work, "synth.dcp")}
-    save(os.path.join(run_dir, "design.json"), design)
-    return design
-
-
-def fabric(run_dir, region=None):
-    log = os.path.join(run_dir, "fabric_%s.log" % (region or "all"))
-    jython("fabric", [PART] + ([region] if region else []), log, run_dir)
-    with open(log) as f:
-        return "\n".join(l for l in f.read().splitlines() if l.startswith(("  ", "Clock", "Site"))) + "\n"
-
-
-# ---- Claude's choice --------------------------------------------------------------------------
-
-def design_text(cfg, d):
-    return ("unit cell %s, %d rows x %d columns of units, instance regex %s\n"
-            "one unit uses: %s\nwhole design: %s\nclock period %.3f ns\n" % (
-                d["unit_cell"], d["unit_rows"], d["unit_cols"], d["unit_regex"],
-                " ".join("%s %d" % kv for kv in sorted(d["unit"].items())),
-                " ".join("%s %d" % kv for kv in sorted(d["total"].items())), cfg["period"]))
-
-
-def ask_claude(cfg, d, run_dir):
-    """Asks Claude once for a block size and rectangle. Returns (spec, notes, cost)."""
-    regions = fabric(run_dir)
+def fabric_text(run_dir):
+    """The device for Claude: every clock region, and the site columns of one full region."""
+    def fabric(region=None):
+        log = os.path.join(run_dir, "fabric_%s.log" % (region or "all"))
+        jython("fabric", [PART] + ([region] if region else []), log, run_dir)
+        with open(log) as f:
+            return "\n".join(l for l in f.read().splitlines() if l.startswith(("  ", "Clock", "Site"))) + "\n"
+    regions = fabric()
     # Regions with the same counts repeat the same columns, so one full region shows the layout.
     full = [l.split() for l in regions.splitlines() if re.match(r"\s+X\d+Y\d+\s+SLR", l)]
     typical = max(full, key=lambda f: (int(f[5]), int(f[4])))[0]
+    return regions + "\n" + fabric(typical)
+
+
+# ---- 2. Claude's choice and the check ---------------------------------------------------------
+
+def ask_claude(cfg, d, fabric, work, failures, attempt):
+    """Asks Claude once for up to 3 ranked blocks. Returns (specs, answer, cost)."""
     with open(os.path.join(SCRIPTS, "agent_instructions.md")) as f:
         prompt = f.read()
-    prompt += "\n## DESIGN\n\n```\n%s```\n\n## FABRIC\n\n```\n%s\n%s```\n" % (
-        design_text(cfg, d), regions, fabric(run_dir, typical))
-    work = os.path.join(run_dir, "claude")
-    os.makedirs(work, exist_ok=True)
-    with open(os.path.join(work, "prompt.md"), "w") as f:
+    prompt += ("\n## DESIGN\n\n```\nunit %s, %d rows x %d columns of units\none unit uses: %s\n"
+               "wires from a unit to its neighbor: %s\nclock period %.3f ns\n```\n") % (
+        d["unit_cell"], d["unit_rows"], d["unit_cols"], " ".join("%s %d" % kv for kv in sorted(d["unit"].items())),
+        ", ".join("%d to the %s" % (n, k) for k, n in sorted(d["wires"].items())), cfg["period"])
+    prompt += "\n## FABRIC\n\n```\n%s```\n" % fabric
+    if failures:
+        prompt += "\n## Earlier answers that failed the check\n\n" + "".join(
+            "- `%s`: %s\n" % (spec, "; ".join(problems)) for spec, problems in failures)
+    tag = "try%d" % attempt
+    with open(os.path.join(work, tag + "_prompt.md"), "w") as f:
         f.write(prompt)
     # No tools and no setting sources: the prompt is Claude's only input.
-    cmd = [os.environ.get("CLAUDE_BIN", "claude"), "-p", "--model", CLAUDE_MODEL, "--effort", "high", "--tools", "",
-           "--setting-sources", "", "--no-session-persistence", "--output-format", "json",
-           "--max-budget-usd", str(CLAUDE_BUDGET_USD)]
-    with open(os.path.join(work, "prompt.md")) as stdin, open(os.path.join(work, "output.json"), "w") as out, \
-            open(os.path.join(work, "stderr.txt"), "w") as err:
+    cmd = [CLAUDE_BIN, "-p", "--model", CLAUDE_MODEL, "--effort", CLAUDE_EFFORT, "--tools", "", "--setting-sources", "",
+           "--no-session-persistence", "--output-format", "json", "--max-budget-usd", "5"]
+    with open(os.path.join(work, tag + "_prompt.md")) as stdin, open(os.path.join(work, tag + "_output.json"), "w") as out, \
+            open(os.path.join(work, tag + "_stderr.txt"), "w") as err:
         code = subprocess.call(cmd, stdin=stdin, stdout=out, stderr=err, cwd=work,
                                env=clean_env({"CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"}))
-    reply = load(os.path.join(work, "output.json")) or {}
+    reply = load(os.path.join(work, tag + "_output.json")) or {}
     text = reply.get("result", "")
-    with open(os.path.join(work, "answer.md"), "w") as f:
+    with open(os.path.join(work, tag + "_answer.md"), "w") as f:
         f.write(text + "\n")
     found = re.findall(r"^SELECTION\s+(\d+x\d+\s+SLICE_X\d+Y\d+:SLICE_X\d+Y\d+)\s*$", text, re.M)
     if code != 0 or not found:
         raise ToolError("Claude gave no SELECTION line (exit %d, see %s)" % (code, work))
-    return found[-1], text, reply.get("total_cost_usd")
+    return found[:3], text, reply.get("total_cost_usd") or 0.0
 
-
-# ---- The pre-implemented flow ----------------------------------------------------------------
 
 def parse_spec(text):
     found = re.fullmatch(r"\s*(\d+)x(\d+)\s+(SLICE_X(\d+)Y(\d+):SLICE_X(\d+)Y(\d+))\s*", text)
@@ -265,16 +335,23 @@ def parse_spec(text):
     return {"tr": int(g[0]), "tc": int(g[1]), "rect": g[2], "xy": [int(v) for v in g[3:]]}
 
 
-def check(d, block, run_dir):
-    """Geometry, resources and the copy grid, from the device itself, before any P&R."""
-    rows, cols = d["unit_rows"] // block["tr"], d["unit_cols"] // block["tc"]
-    if cols > rows:  # The longer side of the copy grid runs up the device (rapidwright.py group).
-        rows, cols = cols, rows
-    save(os.path.join(run_dir, "check_in.json"), [{"id": "block", "part": PART, "rect": block["rect"], "rows": rows, "cols": cols}])
-    jython("check", [os.path.join(run_dir, "check_in.json"), os.path.join(run_dir, "check_out.json")],
-           os.path.join(run_dir, "check.log"), run_dir)
-    g = load(os.path.join(run_dir, "check_out.json"))["block"]
-    x0, y0, x1, y1 = block["xy"]
+def check(d, blocks, work):
+    """Geometry, resources and the copy grid of each block, from the device itself, in one JVM."""
+    jobs = []
+    for i, block in enumerate(blocks):
+        rows, cols = d["unit_rows"] // block["tr"], d["unit_cols"] // block["tc"]
+        if cols > rows:  # The longer side of the copy grid runs up the device (rapidwright.py group).
+            rows, cols = cols, rows
+        jobs.append({"id": str(i), "part": PART, "rect": block["rect"], "rows": rows, "cols": cols})
+    save(os.path.join(work, "check_in.json"), jobs)
+    jython("check", [os.path.join(work, "check_in.json"), os.path.join(work, "check_out.json")], os.path.join(work, "check.log"), work)
+    geometry = load(os.path.join(work, "check_out.json"))
+    return [judge(d, block, job, geometry[job["id"]]) for block, job in zip(blocks, jobs)]
+
+
+def judge(d, block, job, g):
+    """The problems that rule a block out, from its geometry, and what the report shows of it."""
+    rows, cols = job["rows"], job["cols"]
     units = block["tr"] * block["tc"]
     use = dict((k, units * d["unit"].get(k, 0)) for k in ("LUT", "FF", "DSP", "BRAM", "URAM"))
     cap = {"LUT": 8 * g["slices"], "FF": 16 * g["slices"], "DSP": g["dsp"], "BRAM": g["bram"], "URAM": g["uram"]}
@@ -301,53 +378,110 @@ def check(d, block, run_dir):
         lim = g["grid_limit"]
         problems.append("no %d-row x %d-column copy grid fits: at most %d columns or %d rows of copies, and only "
                         "%d rows across %d columns" % (rows, cols, lim["columns"], lim["rows"], lim["rows_for_cols"], cols))
+    elif not problems and max(g["grid"]["row_gaps"] + g["grid"]["col_gaps"]) > MAX_GAP:
+        problems.append("neighboring copies would sit up to %d slices apart (gaps between rows %s, between columns %s); "
+                        "RWRoute cannot route SLR crossings across gaps over %d" % (
+                            max(g["grid"]["row_gaps"] + g["grid"]["col_gaps"]), g["grid"]["row_gaps"], g["grid"]["col_gaps"], MAX_GAP))
     hard = " ".join(r for k, r in sorted(g["ranges"].items()) if use[k] > 0)
-    result = {"spec": "%dx%d %s" % (block["tr"], block["tc"], block["rect"]), "problems": problems,
-              "copies": (d["unit_rows"] // block["tr"]) * (d["unit_cols"] // block["tc"]),
-              "util": dict((k, round(use[k] / float(cap[k]), 3)) for k in use if cap[k]),
-              "positions": g["positions"], "grid": g["grid"], "pblock": (block["rect"] + " " + hard).strip()}
-    save(os.path.join(run_dir, "check.json"), result)
-    return result
+    return {"spec": "%dx%d %s" % (block["tr"], block["tc"], block["rect"]), "problems": problems,
+            "copies": (d["unit_rows"] // block["tr"]) * (d["unit_cols"] // block["tc"]),
+            "util": dict((k, round(use[k] / float(cap[k]), 3)) for k in use if cap[k]),
+            "positions": g["positions"], "pblock": (block["rect"] + " " + hard).strip()}
 
 
-def implement(cfg, d, block, checked, run_dir):
-    """Groups the units into blocks, places and routes one block, and picks the copy anchors."""
-    work = os.path.join(run_dir, "block")
+# Where a candidate's exact tile pattern allows no copy grid, a shift of a few slices often does.
+# Shifts are tried nearest first, rows in steps of two to keep the DSP pairing.
+SHIFTS = sorted(((dx, dy) for dy in range(-8, 9, 2) for dx in range(-4, 5) if (dx, dy) != (0, 0)),
+                key=lambda s: abs(s[0]) + abs(s[1]))
+
+
+def shifted(spec, dx, dy):
+    b = parse_spec(spec)
+    x0, y0, x1, y1 = b["xy"]
+    if min(x0 + dx, y0 + dy) < 0:
+        return None
+    return "%dx%d SLICE_X%dY%d:SLICE_X%dY%d" % (b["tr"], b["tc"], x0 + dx, y0 + dy, x1 + dx, y1 + dy)
+
+
+def choose_block(cfg, d, fabric, run_dir, given):
+    """The first of Claude's ranked candidates that passes the check, else the first that passes
+    after the smallest shift, else Claude is asked again with the problems. --block skips Claude."""
+    work = os.path.join(run_dir, "claude")
     os.makedirs(work, exist_ok=True)
-    seconds = {}
-    t0 = time.time()
-    jython("group", [d["synth_dcp"], os.path.join(work, "block_synth.dcp"), os.path.join(work, "top_blackbox.dcp"),
-                     os.path.join(work, "info.txt"), os.path.join(work, "side_map.txt"), d["unit_cell"], d["unit_regex"],
-                     block["tr"], block["tc"], cfg["period"]], os.path.join(work, "group.log"), work)
-    with open(os.path.join(work, "info.txt")) as f:
-        info = dict(line.split() for line in f if line.strip())
-    seconds["group"] = round(time.time() - t0, 1)
-    t0 = time.time()
-    clock, ranges, side_map = info["CLOCK"], checked["pblock"], os.path.join(work, "side_map.txt")
-    jython("harness", ["add", os.path.join(work, "block_synth.dcp"), os.path.join(work, "block_flops.dcp"), clock, ranges,
-                       side_map], os.path.join(work, "harness_add.log"), work)
-    raw = vivado(cfg, "impl", {"harness_dcp": os.path.join(work, "block_flops.dcp"), "ranges": ranges, "clock": clock,
-                               "out_dcp": os.path.join(work, "block_routed_flops.dcp")}, work)
-    jython("harness", ["remove", os.path.join(work, "block_routed_flops.dcp"), os.path.join(work, "block_routed.dcp"),
-                       clock, ranges], os.path.join(work, "harness_remove.log"), work)
-    for name in ("block_flops", "block_routed_flops"):
-        for ext in (".dcp", ".edf"):
-            if os.path.exists(os.path.join(work, name + ext)):
-                os.remove(os.path.join(work, name + ext))
-    seconds["impl"] = round(time.time() - t0, 1)
-    t0 = time.time()
-    jython("place", [os.path.join(work, "block_routed.dcp"), os.path.join(work, "top_blackbox.dcp"),
-                     os.path.join(work, "placement.txt"), ranges, side_map, os.path.join(work, "copy_pblocks.txt"),
-                     os.path.join(work, "place.json")], os.path.join(work, "place.log"), work)
-    seconds["place"] = round(time.time() - t0, 1)
-    return {"dir": work, "clock": clock, "pblock": ranges, "block": numbers(raw), "grid": load(os.path.join(work, "place.json")),
-            "ports": dict((k[6:], int(v)) for k, v in info.items() if k.startswith("PORTS_")), "seconds": seconds}
+    failures, answers, cost = [], [], 0.0
+    for attempt in range(1, (1 if given else CLAUDE_TRIES) + 1):
+        if given:
+            specs = [given]
+        else:
+            specs, answer, spent = ask_claude(cfg, d, fabric, work, failures, attempt)
+            answers.append(answer)
+            cost += spent
+        results = check(d, [parse_spec(s) for s in specs], work)
+        for spec, checked in zip(specs, results):
+            print("Candidate %s: %s" % (spec, "; ".join(checked["problems"]) or "passes"))
+            if not checked["problems"]:
+                return checked, answers, cost, failures
+        variants = [(spec, v) for spec in specs for v in (shifted(spec, dx, dy) for dx, dy in SHIFTS) if v]
+        for (spec, v), checked in zip(variants, check(d, [parse_spec(v) for _, v in variants], work)):
+            if not checked["problems"]:
+                print("Moved %s to %s, the nearest position that passes" % (spec, v))
+                checked["moved_from"] = spec
+                return checked, answers, cost, failures
+        failures += [(spec, checked["problems"]) for spec, checked in zip(specs, results)]
+    raise ToolError("no block passed the check: " + " / ".join("%s: %s" % (s, "; ".join(p)) for s, p in failures))
 
 
-def block_of(pin):
-    found = re.match(r"(block_\d+_\d+)/", pin)
-    return found.group(1) if found else None
+# ---- 3-5. Group, block, array -----------------------------------------------------------------
 
+def start_block_vivado(cfg, work):
+    """Starts the block's Vivado run early, so the device has loaded by the time the block
+    exists. It waits for the file "ready", which carries the PBlock ranges, or "abort"."""
+    os.makedirs(work, exist_ok=True)
+    p = lambda name: os.path.join(work, name)
+    pool = ThreadPoolExecutor(1)
+    job = pool.submit(vivado, cfg, "impl", {"harness_dcp": p("block_flops.dcp"), "info": p("info.txt"),
+                                            "out_dcp": p("block_routed_flops.dcp")}, work)
+    pool.shutdown(wait=False)
+    return job
+
+
+def build(cfg, d, checked, work, final_dcp, times, block_vivado):
+    block = parse_spec(checked["spec"])
+    p = lambda name: os.path.join(work, name)
+    ranges = checked["pblock"]
+    t0 = time.time()
+    step("Grouping the units into %dx%d blocks" % (block["tr"], block["tc"]))
+    jython("group", [d["top_edf"], d["unit_edf"], p("block_synth.dcp"), p("top_blackbox.dcp"), p("info.txt"),
+                     p("side_map.txt"), d["unit_cell"], d["unit_regex"], block["tr"], block["tc"], cfg["period"]],
+           p("group.log"), work)
+    with open(p("info.txt")) as f:
+        clock = dict(line.split() for line in f if line.strip())["CLOCK"]
+    times["group"] = time.time() - t0
+    t0 = time.time()
+    step("Placing and routing one block in %s" % ranges)
+    jython("harness", ["add", p("block_synth.dcp"), p("block_flops.dcp"), clock, ranges, p("side_map.txt")],
+           p("harness_add.log"), work)
+    with open(p("ready.tmp"), "w") as f:
+        f.write(ranges)
+    os.rename(p("ready.tmp"), p("ready"))
+    block_result = numbers(block_vivado.result())
+    times["block"] = time.time() - t0
+    print("Block alone: WNS %s ns (%s MHz)" % (block_result.get("wns"), block_result.get("fmax")))
+
+    t0 = time.time()
+    step("Stamping %d copies and routing the array (ArrayBuilder, RWRoute)" % checked["copies"])
+    jython("array", [p("block_routed_flops.dcp"), p("block_routed.dcp"), clock, ranges, p("top_blackbox.dcp"), p("side_map.txt"),
+                     p("placement.txt"), p("copy_pblocks.txt"), p("grid.json"), final_dcp, cfg["period"]],
+           p("array.log"), work, ARRAYBUILDER_LIMIT_S)
+    times["array"] = time.time() - t0
+    with open(p("array.log"), errors="replace") as f:
+        abandoned = sum("Unroutable connection" in line for line in f)
+    if abandoned:
+        print("RWRoute abandoned %d connections" % abandoned)
+    return {"clock": clock, "block": block_result, "grid": load(p("grid.json")), "abandoned": abandoned}
+
+
+# ---- 6-7. Measurements outside the compile time -----------------------------------------------
 
 def classify(paths_tsv):
     """Counts the worst paths by where they run: inside a block, or between blocks in one or two SLRs."""
@@ -358,10 +492,11 @@ def classify(paths_tsv):
                 fields = line.rstrip("\n").split("\t")
                 if len(fields) < 10:
                     continue
-                slack, a, b = float(fields[0]), block_of(fields[4]), block_of(fields[5])
+                slack = float(fields[0])
+                a, b = [re.match(r"(block_\d+_\d+)/", pin) for pin in fields[4:6]]
                 if a is None or b is None:
                     kind = "top level"
-                elif a == b:
+                elif a.group(1) == b.group(1):
                     kind = "inside a block"
                 else:
                     kind = "between blocks, %s" % ("across SLRs" if fields[8] != fields[9] else "same SLR")
@@ -373,53 +508,20 @@ def classify(paths_tsv):
     return counts
 
 
-def stitch(cfg, impl, run_dir):
-    """Places every copy and routes the stitching (ArrayBuilder), then finishes and times it in Vivado."""
-    work = os.path.join(run_dir, "stitch")
-    os.makedirs(work, exist_ok=True)
-    t0 = time.time()
-    array = os.path.join(work, "array.dcp")
-    log = os.path.join(work, "arraybuilder.log")
-    cmd = java_cmd("com.xilinx.rapidwright.design.tools.ArrayBuilder",
-                   ["--input", os.path.join(impl["dir"], "block_routed.dcp"),
-                    "--top-design", os.path.join(impl["dir"], "top_blackbox.dcp"), "--output", array,
-                    "--pblock", impl["pblock"], "--clk-period", cfg["period"],
-                    "--kernel-clk-name", impl["clock"], "--top-clk-name", impl["clock"],
-                    "--read-placement", os.path.join(impl["dir"], "placement.txt"), "--skip-impl", "--out-of-context",
-                    "--unroute-static-nets", "--route"], work)
-    if run(cmd, log, work, clean_env(), ARRAYBUILDER_LIMIT_S) != 0 or not os.path.exists(array):
-        raise ToolError("ArrayBuilder failed: %s (log %s)" % (tail(log), log))
-    arraybuilder_s = round(time.time() - t0, 1)
-    t0 = time.time()
-    raw = vivado(cfg, "stitch", {"array_dcp": array, "clock": impl["clock"], "max_paths": 1000,
-                                 "copy_pblocks": os.path.join(impl["dir"], "copy_pblocks.txt"),
-                                 "final_dcp": os.path.join(work, "final.dcp")}, work)
-    for ext in (".dcp", ".edf"):
-        if os.path.exists(array[:-4] + ext):
-            os.remove(array[:-4] + ext)
-    # The final step counts to the end of routing, like the flat run: Vivado's time to its last
-    # route plus the process start, not the reports and checkpoint after it.
-    startup = max(0.0, (time.time() - t0) - (number(raw.get("vivado_seconds")) or 0.0))
-    return {"final": numbers(raw), "paths": classify(os.path.join(work, "paths.tsv")), "final_dcp": os.path.join(work, "final.dcp"),
-            "seconds": {"arraybuilder": arraybuilder_s, "final": round(number(raw["route_seconds"]) + startup, 1)}}
-
-
-# ---- Flat baseline and report -----------------------------------------------------------------
-
-def flat_run(cfg, run_dir, result_dir, source):
+def flat_baseline(cfg, run_dir, result_dir, source):
     if source == "none":
-        return {}
+        return {"source": "not run"}
     if source != "fresh":
         flat = load(os.path.join(source if os.path.isabs(source) else os.path.join(ROOT, source), "flat.json"))
         if flat is None:
             raise ToolError("no flat.json in %s" % source)
-        flat["source"] = "reused from %s" % source
-        return flat
-    flat = numbers(vivado(cfg, "flat", {"flat_dcp": os.path.join(result_dir, "flat.dcp")}, os.path.join(run_dir, "flat")))
-    flat["minutes"] = round(flat["seconds"] / 60.0, 1)
-    flat["source"] = "this run"
-    return flat
+        return dict(flat, source="reused from %s" % source)
+    flat = numbers(vivado(cfg, "flat", {"flat_dcp": os.path.join(result_dir, "flat.dcp"), "sources": cfg["sources"]},
+                          os.path.join(run_dir, "flat")))
+    return dict(flat, minutes=round(flat["seconds"] / 60.0, 1), source="this run")
 
+
+# ---- Report -----------------------------------------------------------------------------------
 
 def show(v):
     if v is None:
@@ -429,56 +531,42 @@ def show(v):
     return str(v)
 
 
-def diff(a, b, kind):
-    if a is None or b is None or kind == "none":
-        return "n/a"
-    if kind == "ns":
-        return "%+.3f ns" % (b - a)
-    return "%+.1f%%" % (100.0 * (b - a) / a) if a else "n/a"
-
-
-def write_report(path, cfg, run, flat):
-    pre = run.get("stitch", {}).get("final", {})
-    lines = ["# %s %s, %s, %s ns clock" % (cfg["top"], " ".join(cfg["generics"]), PART, cfg["period"]), ""]
-    if run.get("spec"):
-        lines.append("Block: `%s`, chosen by %s." % (run["spec"], run["chosen_by"]))
-    if run.get("error"):
-        lines.append("Pre-implemented flow FAILED: %s" % run["error"])
-    lines += ["Flat baseline: %s." % flat.get("source", "not run"), "",
-              "| Metric | Flat Vivado | Pre-implemented | Pre-implemented vs flat |", "|---|---|---|---|"]
-    for label, key, kind in (("Compile time (min)", "minutes", "percent"), ("Setup WNS (ns)", "setup", "ns"),
-                             ("Hold WNS (ns)", "hold", "ns"), ("Fmax (MHz)", "fmax", "percent"),
-                             ("Route errors", "errors", "none"), ("LUT", "LUT", "percent"), ("FF", "FF", "percent"),
-                             ("DSP", "DSP", "percent")):
-        a, b = flat.get(key), (run.get("minutes") if key == "minutes" else pre.get(key))
-        if key == "errors":
-            a, b = (None if a is None else int(a)), (None if b is None else int(b))
-        lines.append("| %s | %s | %s | %s |" % (label, show(a), show(b), diff(a, b, kind)))
-    lines += ["", "Pre-implemented compile time is synthesis, grouping, the block run, anchors, ArrayBuilder and the final "
-              "route. Its FF count includes the port flops, whose paths are excluded from timing because the flat run's "
-              "ports are untimed."]
-    s = run.get("seconds")
-    if s:
-        lines += ["", "Minutes: " + ", ".join("%s %.1f" % (k, v / 60.0) for k, v in s.items()) + "."]
-    c = run.get("check")
+def write_report(path, cfg, r, flat):
+    t = r.get("timing", {})
+    lines = ["# %s %s, %s ns clock" % (cfg["top"], " ".join(cfg["generics"]), cfg["period"]), ""]
+    if r.get("spec"):
+        moved = r["check"].get("moved_from")
+        lines.append("Block `%s`, chosen by %s%s." % (r["spec"], r["chosen_by"], ", moved from `%s` to the nearest position that passes the check" % moved if moved else ""))
+    if r.get("error"):
+        lines.append("Pre-implemented flow FAILED: %s" % r["error"])
+    lines += ["Flat baseline: %s." % flat.get("source"), "",
+              "| | Flat Vivado | Pre-implemented |", "|---|---|---|",
+              "| Compile time (min) | %s | %s |" % (show(flat.get("minutes")), show(r.get("minutes"))),
+              "| Fmax (MHz) | %s | %s |" % (show(flat.get("fmax")), show(t.get("fmax"))),
+              "| Setup WNS (ns) | %s | %s |" % (show(flat.get("setup")), show(t.get("setup"))),
+              "| Hold WNS (ns) | %s | %s |" % (show(flat.get("hold")), show(t.get("hold"))),
+              "| Route errors | %s | %s |" % (show(flat.get("errors")), show(t.get("errors"))), ""]
+    if r.get("times"):
+        lines.append("Compile time, RTL to the routed checkpoint (target %d min, limit %d): %s." % (TARGET_MIN, LIMIT_MIN, ", ".join(
+            "%s %.1f" % (k, v / 60.0) for k, v in r["times"].items())))
+        lines.append("Vivado then took %.1f min to open and time the result; that is not part of the compile time." % (t.get("vivado_seconds", 0) / 60.0))
+    c = r.get("check")
     if c:
-        lines += ["", "Check: %d copies, %d legal positions, utilization %s." % (
+        lines += ["", "Check: %d copies, %d legal positions, use %s." % (
             c["copies"], c["positions"], " ".join("%s %.0f%%" % (k, 100 * v) for k, v in sorted(c["util"].items()) if v))]
-    b = run.get("impl", {}).get("block")
+    b = r.get("build", {}).get("block")
     if b:
         lines.append("Block alone: WNS %s ns (%s MHz), through port flops in %s / out %s ns." % (
             b.get("wns"), b.get("fmax"), b.get("port_in_wns"), b.get("port_out_wns")))
-    if run.get("stitch"):
-        lines += ["", "## Worst paths", ""]
-        for kind, c in sorted(run["stitch"]["paths"].items()):
-            lines.append("- %s: %d paths under 0.1 ns slack, %d failing, worst %.3f ns (datapath %.3f ns)" % (
-                kind, c["paths"], c["failing"], c["worst"], c["datapath_ns"]))
-        if not run["stitch"]["paths"]:
-            lines.append("No path has less than 0.1 ns of slack.")
-        lines.append("\nSLR-crossing nets rerouted by Vivado: %s." % show(pre.get("slr_nets")))
-    if run.get("notes"):
-        lines += ["", "## Claude's answer", "", "API cost: %s." % ("$%.2f" % run["cost_usd"] if run.get("cost_usd") else "n/a"),
-                  "", run["notes"].strip()]
+        lines.append("RWRoute abandoned %d connections." % r["build"]["abandoned"])
+    if r.get("paths"):
+        lines += ["", "## Worst paths", ""] + ["- %s: %d paths under 0.1 ns slack, %d failing, worst %.3f ns (datapath %.3f ns)" % (
+            kind, c["paths"], c["failing"], c["worst"], c["datapath_ns"]) for kind, c in sorted(r["paths"].items())]
+    if r.get("answers"):
+        lines += ["", "## Claude", "", "%d answer(s), $%.2f." % (len(r["answers"]), r["cost_usd"])]
+        for spec, problems in r.get("failures", []):
+            lines.append("- `%s` failed the check: %s" % (spec, "; ".join(problems)))
+        lines += ["", "Final answer:", "", r["answers"][-1].strip()]
     with open(path, "w") as f:
         f.write("\n".join(lines) + "\n")
     print("\n".join(lines))
@@ -490,11 +578,13 @@ def next_run(results):
 
 
 def main():
+    sys.stdout = open(sys.stdout.fileno(), "w", buffering=1, closefd=False)  # line-buffered, for logs
     ap = argparse.ArgumentParser()
     ap.add_argument("--top", required=True)
     ap.add_argument("--period", required=True, type=float)
     ap.add_argument("--generic", action="append", default=[])
     ap.add_argument("--block", help='"<rows>x<cols> SLICE_X..Y..:SLICE_X..Y.." to skip Claude')
+    ap.add_argument("--unit", help="the repeated module, if the top instantiates several")
     ap.add_argument("--flat", default="fresh", help="fresh, none, or a results/runN directory to reuse")
     ap.add_argument("sources", nargs="+")
     a = ap.parse_args()
@@ -506,60 +596,55 @@ def main():
     os.makedirs(result_dir)
     os.makedirs(run_dir)
     cfg = {"top": a.top, "period": a.period, "generics": a.generic, "sources": [os.path.abspath(s) for s in a.sources]}
-    save(os.path.join(run_dir, "config.json"), cfg)
+    final_dcp = os.path.join(result_dir, "final.dcp")
     print("Run %s: %s" % (name, run_dir))
 
-    run = {"chosen_by": "hand (--block)" if a.block else "Claude (%s)" % CLAUDE_MODEL}
+    r = {"chosen_by": "hand (--block)" if a.block else "Claude (%s)" % CLAUDE_MODEL, "times": {}}
+    start = time.time()
+    block_dir = os.path.join(run_dir, "block")
     try:
-        step("Synthesizing the full design")
-        d = synthesize(cfg, run_dir)
+        step("Synthesizing the unit and the top in parallel")
+        t0 = time.time()
+        d, fabric = synthesize(cfg, run_dir, a.unit)
+        r["times"]["synthesis"] = time.time() - t0
+        # Started after synthesis: three Vivado processes loading the device at once slowed
+        # synthesis by minutes (run48), and Claude's answer still hides this one's load.
+        block_vivado = start_block_vivado(cfg, block_dir)
         print("Unit %s on a %dx%d grid: %s" % (d["unit_cell"], d["unit_rows"], d["unit_cols"], d["unit"]))
-        if a.block:
-            run["spec"] = a.block
-        else:
-            step("Asking Claude for the block size and PBlock")
-            run["spec"], run["notes"], run["cost_usd"] = ask_claude(cfg, d, run_dir)
-        print("Block: %s" % run["spec"])
-        block = parse_spec(run["spec"])
-        step("Checking the PBlock")
-        run["check"] = check(d, block, run_dir)
-        if run["check"]["problems"]:
-            raise ToolError("the PBlock fails its check: " + "; ".join(run["check"]["problems"]))
-        print("%d copies, %d legal positions, pblock %s" % (run["check"]["copies"], run["check"]["positions"], run["check"]["pblock"]))
-        step("Implementing one block")
-        run["impl"] = implement(cfg, d, block, run["check"], run_dir)
-        print("Block WNS %s ns (%s MHz alone)" % (run["impl"]["block"].get("wns"), run["impl"]["block"].get("fmax")))
-        step("Stitching the array")
-        run["stitch"] = stitch(cfg, run["impl"], run_dir)
-        run["seconds"] = dict([("synthesis", d["synth_seconds"])] + list(run["impl"]["seconds"].items()) +
-                              list(run["stitch"]["seconds"].items()))
-        run["minutes"] = round(sum(run["seconds"].values()) / 60.0, 1)
-        shutil.copy(run["stitch"]["final_dcp"], os.path.join(result_dir, "final.dcp"))
+        step("Choosing the block" + ("" if a.block else " (Claude)"))
+        t0 = time.time()
+        r["check"], r["answers"], r["cost_usd"], r["failures"] = choose_block(cfg, d, fabric, run_dir, a.block)
+        r["spec"] = r["check"]["spec"]
+        r["times"]["choice"] = time.time() - t0
+        r["build"] = build(cfg, d, r["check"], block_dir, final_dcp, r["times"], block_vivado)
+        r["minutes"] = round((time.time() - start) / 60.0, 1)
+        r["times"]["total"] = time.time() - start
+        step("Compiled in %.1f min: %s" % (r["minutes"], final_dcp))
+        step("Timing the result in Vivado (not part of the compile time)")
+        r["timing"] = numbers(vivado(cfg, "timing", {"array_dcp": final_dcp, "clock": r["build"]["clock"]}, os.path.join(run_dir, "timing")))
+        r["paths"] = classify(os.path.join(run_dir, "timing", "paths.tsv"))
     except ToolError as e:
-        run["error"] = str(e)
+        r["error"] = str(e)
         print("PRE-IMPLEMENTED FLOW FAILED: %s" % e)
-    save(os.path.join(run_dir, "run.json"), run)
+        if os.path.isdir(block_dir) and not os.path.exists(os.path.join(block_dir, "ready")):
+            open(os.path.join(block_dir, "abort"), "w").close()
+    save(os.path.join(run_dir, "run.json"), r)
 
     if a.flat == "fresh":
         step("Flat Vivado baseline")
     try:
-        flat = flat_run(cfg, run_dir, result_dir, a.flat)
+        flat = flat_baseline(cfg, run_dir, result_dir, a.flat)
     except ToolError as e:
         flat = {"source": "FAILED: %s" % e}
-        print("FLAT RUN FAILED: %s" % e)
     save(os.path.join(result_dir, "flat.json"), flat)
 
     report = os.path.join(result_dir, "report.md")
-    write_report(report, cfg, run, flat)
+    write_report(report, cfg, r, flat)
     step("Done: %s" % report)
-    pre_fmax, flat_fmax = number(run.get("stitch", {}).get("final", {}).get("fmax")), number(flat.get("fmax"))
-    if pre_fmax is None or flat_fmax is None or run["stitch"]["final"].get("errors") != 0:
-        print("RUNTEST FAILED: see %s" % report)
+    if r.get("timing", {}).get("errors") != 0 or r.get("minutes", LIMIT_MIN + 1) > LIMIT_MIN:
+        print("RUN FAILED: see %s" % report)
         return 1
-    if pre_fmax <= flat_fmax:
-        print("RUNTEST FAILED: pre-implemented Fmax %s MHz does not beat flat %s MHz" % (pre_fmax, flat_fmax))
-        return 1
-    print("RUNTEST PASSED: %s" % os.path.join(result_dir, "final.dcp"))
+    print("RUN PASSED: routed in %.1f min, Fmax %s MHz (flat %s)" % (r["minutes"], r["timing"].get("fmax"), flat.get("fmax")))
     return 0
 
 

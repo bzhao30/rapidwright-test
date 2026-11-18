@@ -1,96 +1,84 @@
 # Accelerated PAR for the Alveo V80
 
-Routes one block once and copies it instead of placing and routing the whole design, then compares against flat Vivado. The open choice is how to cut the design into blocks and where the block's PBlock sits. Claude makes that choice once, from a description of the design and the device, and the flow then implements, copies and stitches the block.
+Compiles a design built from one repeated unit, such as a systolic array, in minutes instead of an hour. Instead of placing and routing the whole design, it places and routes one block of units once, copies it across the device with RapidWright, and lets RWRoute route the wires between copies. The full design never goes back into Vivado. Claude chooses how big the block is and where its PBlock sits.
 
-A run passes if both flows route and the pre-implemented flow has the higher Fmax. Closing timing at the requested period is not required.
+The target is about 10 minutes from RTL to a routed checkpoint, and never more than 45. Speed comes first: Fmax is measured and reported against flat Vivado, but beating it is not required.
 
 ## Run
 
-Set your paths at the top of `scripts/run.sh`, then:
+Set your machine's paths at the top of `scripts/run.py` (or in the environment), then:
 
 ```
-scripts/run.sh --top systolic64 --period 1.8 --generic ROWS=64 --generic COLS=64 hdl/src/systolic64.v
+python3 scripts/run.py --top systolic64 --period 1.8 --generic ROWS=64 --generic COLS=64 hdl/src/systolic64.v
 ```
 
 | Option | Meaning |
 |---|---|
-| `--block "8x2 SLICE_X84Y96:SLICE_X103Y111"` | Skip Claude and use this block: 8x2 units in that slice rectangle, to reproduce a result |
-| `--flat fresh`, `--flat results/runM`, `--flat none` | Run the flat baseline, reuse an earlier run's flat result (only fair for the same RTL, clock and Vivado), or skip it |
+| `--block "8x2 SLICE_X84Y96:SLICE_X103Y111"` | Skip Claude and use this block: 8x2 units in that slice rectangle |
+| `--unit NAME` | The repeated module, if the top instantiates more than one |
+| `--flat fresh`, `--flat results/runM`, `--flat none` | Run the flat Vivado baseline, reuse an earlier run's (only fair for the same RTL, clock and Vivado), or skip it |
 
-Each run gets `results/runN/` with `report.md` (the comparison, the block and Claude's reasoning), `final.dcp`, `flat.dcp` and `flat.json`. Logs and intermediate files are in `build/runN/`, including Claude's prompt and answer in `build/runN/claude/`.
+Each run writes `results/runN/` with `report.md` (compile time by step, Fmax against flat, the block and Claude's answer), `final.dcp` (the routed design) and `flat.json`. Logs and intermediate files are in `build/runN/`, with Claude's prompts and answers in `build/runN/claude/`. The exit code is 0 if the result is fully routed within 45 minutes.
 
 ## The flow
 
-1. Vivado synthesizes the full design with its hierarchy kept, and `run.py` finds the repeated unit and its row/column grid from the instance names.
-2. Claude reads `scripts/agent_instructions.md`, the unit's resource use and the device's clock regions and site columns, and answers with one block size and rectangle. It has no tools and is asked once.
-3. RapidWright checks the rectangle against the device before any place and route: the DSP/BRAM/URAM sites inside it, use against that capacity, one clock region and SLR, at least 12 rows from the SLR edges, and a legal copy position for every block of the grid. A rectangle that fails stops the run.
-4. RapidWright groups the units into identical blocks and writes one block plus a top with every block black-boxed.
-5. Vivado places and routes one block in a hard PBlock (`IS_SOFT 0`, `CONTAIN_ROUTING` except CE/reset nets), with temporary port flops standing in for the neighbors.
-6. ArrayBuilder stamps the routed block at each copy position, and RWRoute routes the stitching.
-7. Vivado finishes the design: it reroutes the nets between blocks in different SLRs and any nets RWRoute left in conflict with `route_design -preserve -no_psir`, routes the VCC/GND pins that ArrayBuilder misses on Versal, and times the array.
-8. Vivado runs the same design flat, as the baseline.
+Timed from RTL to the routed checkpoint:
+
+| Step | What happens | Minutes (runs 46-49) |
+|---|---|---|
+| 1. Synthesis | Vivado synthesizes the repeated unit alone, and the top with the unit as a black box, in parallel. Only EDIF is written. The top's instance names give the unit grid, and its nets give the bus widths between neighboring units. | 2.6-4.0 |
+| 2. Choice | Claude reads `scripts/agent_instructions.md` with the unit's resources, the bus widths and the device's clock regions and site columns, and ranks up to 3 candidates. RapidWright checks them against the device in seconds; the first that passes is used, moved by a few slices if its copy grid only fits there. If none passes, Claude is asked again with the problems, up to 3 times. Meanwhile Vivado starts for step 4 and loads the device. | 1.6-2.2 |
+| 3. Group | RapidWright fills the black boxes with the unit's netlist and groups the units into identical blocks: one block netlist, and the top with every block as a black box. | 0.4-0.5 |
+| 4. Block | Vivado places and routes one block in a hard PBlock (`CONTAIN_ROUTING` on, except CE/reset nets), with temporary port flops standing in for the neighbors. | 3.5-4.3 |
+| 5. Array | RapidWright removes the port flops and picks the copy positions; ArrayBuilder stamps the block at each and RWRoute routes everything between copies, including the SLR crossings. | 2.9-3.6 |
+
+Measured afterwards, outside the compile time: Vivado opens the result only to time it and check its routing (about 10 minutes at 64x64), and runs the same RTL flat as the baseline (about an hour).
 
 ## Files
 
 | File | What it does |
 |---|---|
-| `scripts/run.sh` | Entry point. Holds the machine paths, checks the tools, and starts `run.py`. |
-| `scripts/run.py` | The run: synthesis, Claude's choice, the check, block, stitch and flat steps, and `report.md`. |
-| `scripts/agent_instructions.md` | What Claude is told: the flow, the rules a rectangle must meet, what sets Fmax on the V80, and the answer format. |
-| `scripts/flow.tcl` | The Vivado steps (synthesis, block run, final route, flat baseline), one command per Vivado process. |
-| `scripts/rapidwright.py` | The Jython RapidWright steps: `group`, `harness`, `place`, `check` and `fabric` (the device description Claude reads). |
+| `scripts/run.py` | The run: machine paths, the steps above, the flat baseline and `report.md`. |
+| `scripts/agent_instructions.md` | What Claude is told: how the flow uses its answer, the rules a rectangle must meet, and what sets compile time and Fmax on the V80. |
+| `scripts/flow.tcl` | The Vivado steps: `synth_unit`, `synth_top`, `impl` (the block), `timing` and `flat`, one per Vivado process. |
+| `scripts/rapidwright.py` | The Jython RapidWright steps: `fabric` (the device description), `check`, `group`, `harness` and `array`. |
 | `hdl/src/systolic64.v` | The test design: a parameterized systolic array of `systolic_pe` units, each mapping its multiply-accumulate to one DSP58. |
 | `hdl/sim/systolic64_tb.sv`, `hdl/sim/run_xsim.sh` | Randomized testbench and its XSim runner. |
 
 ## Results
 
-The design is fixed: `systolic64` with `ROWS=64 COLS=64`, 4096 PEs, each mapping its multiply-accumulate to one DSP58 (all 4096 DSPs on the V80). What varies is the block, the PBlock-sized piece of the array that is implemented once and copied: `RxC` means R x C PEs per block. Flat Vivado on the same RTL reaches 369.5 MHz in 58.5 minutes at a 2.0 ns target (run27), and 397.3 MHz in 56.8 minutes at 1.8 ns (run39). Every pre-implemented result below routes with 0 errors.
+`systolic64` with `ROWS=64 COLS=64`: 4096 PEs, each one DSP58 (every DSP on the V80), at a 1.8 ns target. Flat Vivado reaches 397.3 MHz in 56.8 minutes (run39). `RxC` is a block of R x C PEs.
 
-### Block size
+| Run | Block (chosen by Claude) | Compile (min) | Fmax (MHz) | vs flat | Route errors |
+|---|---|---|---|---|---|
+| run49 | 8x2 `SLICE_X92Y108:SLICE_X99Y123` | 13.5 | 392.8 | -1.1% | 0 |
+| run48 | 8x2 `SLICE_X91Y100:SLICE_X100Y115` | 14.8 | 400.6 | +0.8% | 0 |
+| run47 | 8x2 `SLICE_X90Y94:SLICE_X101Y109`, moved up 2 rows | 12.5 | 384.9 | -3.1% | 0 |
+| run46 | 8x2 `SLICE_X92Y108:SLICE_X99Y123` | 12.3 | 392.8 | -1.1% | 0 |
+| run45 | 8x4 `SLICE_X92Y92:SLICE_X99Y123`, moved down 8 rows | 12.5 | 404.9 | +1.9% | 48 |
+| run43 | 16x2 `SLICE_X94Y96:SLICE_X117Y111` | 14.2 | 384.0 | -3.3% | 0 |
+| run42 | 8x2 `SLICE_X92Y92:SLICE_X99Y107` | 13.3 | 399.8 | +0.6% | 3330 |
+| run41 | 2x8 `SLICE_X170Y444:SLICE_X181Y459` | stopped | | | |
 
-Same home clock region (X2Y2) for every size, chosen by hand with what is now `--block`; only the block changes (run38, 2.0 ns target).
+Run41 was stopped after 17 minutes of RWRoute congestion, run42's errors were the top's ports, and run45's were SLR crossings across 32-row gaps between copies; all three causes are fixed or rejected by the check now (below). Run48's synthesis took 5.9 minutes because the block's Vivado started alongside it; it now starts after synthesis. The machine is shared (load average 16 to 24), so the same step varies by a minute between runs.
 
-| Block | PEs per block | Copies | PBlock | Block alone (MHz) | Stitched Fmax (MHz) | WNS (ns) | vs flat | Compile (min) | of which ArrayBuilder / final route |
-|---|---|---|---|---|---|---|---|---|---|
-| 8x1 | 8 | 512 | `SLICE_X84Y96:SLICE_X103Y103` (20x8) | 716.3 | 470.6 | -0.125 | +27.4% | 47.3 | 3.6 / 18.9 |
-| 8x2 | 16 | 256 | `SLICE_X84Y96:SLICE_X103Y111` (20x16) | 716.3 | **508.9** | **+0.035** | **+37.7%** | 54.3 | 3.1 / 26.4 |
-| 8x4 | 32 | 128 | `SLICE_X84Y92:SLICE_X103Y139` (20x48) | 713.3 | 467.1 | -0.141 | +26.4% | 51.5 | 2.9 / 23.4 |
+- **Compile time is 3.8 to 4.6x shorter than flat.** Synthesis went from 16-20 minutes (the whole design with its hierarchy kept) to 2.6 to 4, by synthesizing one unit and the wiring between units separately. Dropping Vivado's final route of the full design saved another 25 to 35 minutes: loading the 64x64 design into Vivado alone takes almost 5.
+- **Fmax is about flat's.** Every failing path is a flop-to-flop wire between copies in different SLRs. RWRoute does not model timing on Versal and routes such a hop in 2.0 to 2.25 ns, where Vivado's timing-driven reroute took 1.75 to 1.82 ns. With that reroute, the same 8x2 block reached 505.8 MHz, but the flow took 53 minutes (run39).
+- **The block's orientation decides whether the array routes in minutes.** The `a` bus between columns is 9 bits per PE; the `b`, `res` and `drain` buses between rows are 43. The copy grid's longer side runs up the device, so a block with fewer rows than columns sends the 43-bit buses across each SLR boundary (64 x 43 = 2752 wires), and RWRoute was still congested after 17 minutes (run41, 2x8 blocks; stopped). With the 9-bit bus across (576 wires), it routes in 1 to 1.5 minutes. Claude now gets the bus widths and picks the right orientation.
+- **Claude's choice.** At medium effort an answer takes 1 to 2 minutes and about $0.20, and since it has the bus widths it has put the narrow bus across the SLR boundaries every time (8x2, 16x2 and 8x4 blocks). Whether copies fit depends on the exact tiles under a rectangle, which Claude cannot see, so candidates a few rows off used to cost a retry of 2 to 5 minutes (run43); the flow now moves them to the nearest legal position in seconds instead (run45, run47).
+- **Where the remaining time goes.** About 10 of the 12 to 14 minutes are fixed tool costs: Vivado elaborating 4096 instances (about 2 minutes), placing one block on a device this large (about 1.8), loading the device (about 40 s per process), and RWRoute (1 to 1.5). Reaching 10 minutes would take overlapping Claude with synthesis, which needs the unit grid and bus widths before the top is synthesized.
 
-The 8x2 result meets 2.0 ns, so it is clipped (see the notes). The same three candidates at a 1.8 ns target (run39), against a fresh flat run at 1.8 ns that reaches 397.3 MHz in 56.8 minutes:
+The block-size sweep with the earlier flow, which synthesized the whole design and had Vivado reroute the SLR crossings (about 50 minutes per compile, 1.8 ns, run39): 8x1 blocks 495.8 MHz, 8x2 505.8 MHz, 8x4 476.9 MHz. Only 8, 16 and 32 PEs per block fit a 64x64 array on the V80: smaller blocks need more columns of copies than there are DSP column pairs (12), 64-PE blocks need 40-slice-wide rectangles with room for only 6 columns, and 128-PE blocks contain the clock-region center row, which leaves 12 positions.
 
-| Block | PEs per block | Copies | Block alone (MHz) | Stitched Fmax (MHz) | WNS (ns) | vs flat | Compile (min) | of which ArrayBuilder / final route | SLR-crossing nets |
-|---|---|---|---|---|---|---|---|---|---|
-| 8x1 | 8 | 512 | 699.3 | 495.8 | -0.217 | +24.8% | 48.5 | 3.3 / 21.2 | 577 |
-| 8x2 | 16 | 256 | 716.3 | **505.8** | -0.177 | **+27.3%** | 53.0 | 3.1 / 25.8 | 1153 |
-| 8x4 | 32 | 128 | 709.7 | 476.9 | -0.297 | +20.0% | 51.3 | 2.9 / 24.3 | 1153 |
-
-The ranking is the same at both targets: 8x2 first, 8x4 last. Every failing path, for every size, is a direct flop-to-flop wire between copies in different SLRs. With 8x4 blocks those wires are slower: across the 1000 worst paths the crossing datapath has a median of 1.75 ns, against 1.66 ns for 8x1 and 8x2. 8x1 has half as many crossing nets as 8x2, because its 64 rows of copies fit across one SLR boundary instead of two, but its worst crossing (1.85 ns) is still slower than 8x2's (1.82 ns). So the worst hop sets Fmax, not the number of hops.
-
-Only these three sizes fit a 64x64 array on the V80 (the check in step 3):
-- **Fewer than 8 PEs per block** (1x1 to 4x1, 2x2): each copy needs its own DSP column pair, so at most 12 columns of copies fit, and those grids need 16 or more.
-- **64 PEs per block** (8x8, 4x16, 16x4): enough DSPs only in a 40-slice-wide rectangle, which allows 6 columns of copies and 48 positions in all.
-- **128 PEs per block** (8x16, 16x8): the rectangle contains the clock-region center row, so a copy can only go to the same spot in another region, 12 positions in all.
-
-### Claude's choice
-
-Claude's one-shot answer is the method under test. Runs 29 to 34 used an earlier, multi-step agent with tool access and budgets, since removed; its best pick was `8x4 SLICE_X84Y92:SLICE_X103Y139` at 465.8 MHz (2.0 ns, run34), below the hand-chosen 8x2 block above.
-
-Notes:
-- Compile time is the flow from synthesis to the end of the final route. Several runs overlapped on the shared machine, so times carry some noise.
-- Fmax is computed from WNS at the target period. Vivado stops improving a route once it meets the target, so a result that meets it (8x2 at 2.0 ns) is a lower bound. Use 1.8 ns for comparisons.
-
-What the runs show:
-- **The SLR crossings decide the result.** Every block alone runs at 699 to 716 MHz, and the worst stitched paths are always flop-to-flop wires between copies in different SLRs. SLL tiles on the V80 have no register sites, and such a hop takes 1.75 to 1.97 ns of route depending on how Vivado routes it. A 64x64 grid needs two SLR boundaries. The 8x2 grid met 2.0 ns with crossings of 1.75 to 1.81 ns; the 8x1 and 8x4 grids each had a few crossings near 1.85 to 1.97 ns. Pinning port registers to the PBlock edge did not shorten them.
-- **Orientation matters.** The longer side of the copy grid runs up the device, which puts the 9-bit-per-PE bus across the SLR boundaries. With the 43-bit bus across them instead, the same rectangle reached 437.4 MHz against 462.3 MHz (run32).
-- **Compile time.** ArrayBuilder stamps and stitches 128 to 512 copies in about 3 minutes. Most of the pre-implemented flow is synthesis (16 min), the block run (8 min) and Vivado's final route (19 to 26 min), against 57 to 59 minutes for the flat place and route.
-
-Fixed: **PBlocks on an SLR edge broke every copy.** Runs 29 and 33 lost every stitch with `[Route 35-19] Pin mapping failure, cannot reach driver pin`. Their home PBlocks sat on the bottom row of an SLR (Y0, the device edge, and Y332, the bottom of SLR1). Long vertical wires turn back at an SLR edge: Vivado routed the block through `OUT_SS12_BEG3`, which at row 7 of the bottom edge returns as `IN_NN12_END3` at row 4 inside the block. Everywhere else that wire runs 12 rows down, out of the block, so RapidWright could not relocate those nets and dropped them from every copy (22 nets for run33's 8x1 block, 177 for run29's), and RWRoute could not reroute them between the packed copies. The earlier guess that short blocks were the problem was a coincidence of where those blocks sat. The check now rejects a rectangle within 12 rows of its SLR's top or bottom, and `rapidwright.py place` compares every routed node of the block with the same wire at an interior copy position and fails with the affected nets if any differ. Copies themselves may sit on the edge rows.
+Fixed along the way:
+- **PBlocks on an SLR edge broke every copy.** Long vertical wires turn back at an SLR or device edge, so a block routed within 12 rows of one used wires no copy position has, and RapidWright dropped those nets from every copy. The check rejects such rectangles, and the array step compares every routed node of the block with the same wire at an interior copy position before copying.
+- **Top ports.** A top built from EDIF is not marked out of context, so Vivado expected its 3330 ports to reach I/O pads (run42). The group step now marks it.
+- **Gaps between copies.** A 32-row block fits once per 48-row half region, so its copies sit 32 rows apart, and RWRoute (run by ArrayBuilder with a fixed bounding box) abandoned 80 SLR crossings across those gaps (run45). The check now rejects copy grids with gaps over 16 slices, and the report counts the connections RWRoute abandoned.
+- **Grouping time.** Finding which side of the block each port faces re-scanned every net for each block; it now reuses the net owners computed just before, which cut grouping from 75 to 30 seconds.
 
 Open issues:
-- **Uncontained control nets.** In narrow PBlocks, a CE or reset net routed before containment sometimes detours outside the PBlock. `rapidwright.py harness` now unroutes up to 64 such nets so ArrayBuilder routes them in each copy.
-- **Stitch time.** Clean 64x64 stitches spend 1.5 to 3.5 minutes in RWRoute. The edge-bug stitches took 12 to 73 minutes, retrying the dropped nets. One clean candidate in run34 (4x8 blocks, the 43-bit bus across the SLR boundaries) was still congested after 90 minutes. A stitch that spends more than 90 minutes in ArrayBuilder now fails instead of stalling.
-
-Vivado writes an EDIF next to each checkpoint that RapidWright reads. Without it, RapidWright starts another Vivado to decrypt the netlist, which takes minutes at 64x64.
+- **Fmax below the old flow's.** RWRoute is not timing-driven on Versal. Pipelining the buses that cross SLRs in the RTL, or rerouting only the SLR-crossing nets with a timing-aware router, would recover most of the 25% the old flow had.
+- **Uncontained control nets.** In narrow PBlocks a CE or reset net routed before containment sometimes leaves the PBlock; up to 64 such nets are unrouted so RWRoute routes them in each copy.
 
 ## Test
 
